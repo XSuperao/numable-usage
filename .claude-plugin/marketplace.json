@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "numable",
+  "description": "Numable 出品的 Claude Code 插件 —— 把开发数据变成手机与桌面小组件。",
+  "owner": { "name": "Numable", "url": "https://numable.app" },
+  "plugins": [
+    {
+      "name": "numable-usage",
+      "source": "./plugin",
+      "version": "0.1.0",
+      "description": "把你的 Claude Code 用量做成手机与桌面小组件：会话数、消息量、token 消耗、活跃热力图、按模型分布。只上传聚合数字，代码与对话永不离开本机。",
+      "author": { "name": "Numable", "url": "https://numable.app" },
+      "homepage": "https://numable.app",
+      "category": "productivity",
+      "keywords": ["usage", "stats", "widget", "dashboard", "tokens", "analytics"]
+    }
+  ]
+}
