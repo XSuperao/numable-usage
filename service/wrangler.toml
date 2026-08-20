@@ -1,0 +1,25 @@
+# numable-usage —— Claude Code 用量投递服务
+#
+# ⚠️ 刻意与 Numable-backend 物理隔开（独立 Worker + 独立 D1）。
+# 塞进主后端，CLAUDE.md 那句「数据面端上直连，后端永不碰」就糊了，而那句要写进隐私政策。
+
+name = "numable-ccusage"
+main = "src/worker.js"
+compatibility_date = "2024-09-23"
+
+routes = [
+  { pattern = "usage.numable.app", custom_domain = true },
+]
+
+# 令牌派生密钥（必须设，否则所有令牌都能被伪造）：
+#   npx wrangler secret put TOKEN_SECRET
+
+[[d1_databases]]
+binding = "DB"
+database_name = "numable-ccusage"
+database_id = "30444857-bfbe-42aa-9fe0-58d4d460323f"
+migrations_dir = "migrations"
+
+# 每天回收 90 天无推送的空间
+[triggers]
+crons = ["17 4 * * *"]

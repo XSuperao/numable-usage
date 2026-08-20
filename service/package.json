@@ -1,0 +1,11 @@
+{
+  "name": "numable-ccusage-service",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --local --port 8787",
+    "deploy": "wrangler deploy",
+    "migrate:local": "wrangler d1 migrations apply numable-ccusage --local",
+    "migrate:remote": "wrangler d1 migrations apply numable-ccusage --remote"
+  }
+}
