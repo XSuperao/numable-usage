@@ -268,7 +268,21 @@ async function cmdStatus() {
   console.log(`本机累积 ${dates.length} 天${dates.length ? `（${dates[0]} → ${dates[dates.length - 1]}）` : ''}`);
   console.log(`会话 ${sess} · 消息 ${fmt(msgs)} · 输出 token ${fmt(out)}`);
   console.log(`服务端 ${cfg.endpoint || ENDPOINT}`);
-  console.log('\n要在新设备上看，用 --code 生成配对码。');
+  console.log('\n把用量接到 Numable：--token 打印读取令牌（粘进 App 的凭证设置）。');
+}
+
+/**
+ * 打印读取令牌本体。
+ * ⚠️ 为什么需要它:短码(`--code`)要 App 端有「输入短码 → 调 /claim → 存令牌」的入口才用得上,
+ * 而四端凭证面板目前是**通用 token 输入框**,没有对接短码。在 App 支持之前,
+ * 接入路径就是把这一串粘进凭证面板。短码机制保留,是给 App 原生支持预留的。
+ */
+async function cmdToken() {
+  const cfg = readJson(CONFIG, null);
+  if (!cfg || !cfg.readToken) { console.log('尚未接入，先跑一次采集（或在 Claude Code 里开一个新会话）。'); return; }
+  console.log('把下面这一整串粘贴到 Numable 的「我的 → 凭证 → Claude Code 用量」里：\n');
+  console.log(cfg.readToken);
+  console.log('\n它只能读你自己的用量数字，不能写、不能改、不能看别人的。');
 }
 
 async function cmdCode() {
@@ -284,6 +298,7 @@ async function main() {
   const arg = process.argv[2];
   if (arg === '--status') return cmdStatus();
   if (arg === '--code') return cmdCode();
+  if (arg === '--token') return cmdToken();
 
   let cfg = readJson(CONFIG, null);
 
