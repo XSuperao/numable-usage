@@ -366,7 +366,10 @@ export default {
     await env.DB.batch([
       env.DB.prepare('DELETE FROM snapshots WHERE space_id IN (SELECT space_id FROM spaces WHERE COALESCE(last_push_at, created_at) < ?1)').bind(cutoff),
       env.DB.prepare('DELETE FROM spaces WHERE COALESCE(last_push_at, created_at) < ?1').bind(cutoff),
-      env.DB.prepare('DELETE FROM rl WHERE win < ?1').bind(Math.floor(cutoff / 60000)),
+      // ⚠️ 限流行按**天**清,不跟空间回收的 90 天 —— 窗口只有 1 分钟,一行超过那一分钟就没用了;
+      //    而 key 里含 IP(`space:<ip>` / `claim:<ip>`),每个访问过的 IP 都会留一行,
+      //    留 90 天就是攒 90 天的垃圾。留一天是给时钟偏移和跨天边界的余量。
+      env.DB.prepare('DELETE FROM rl WHERE win < ?1').bind(Math.floor((Date.now() - 864e5) / 60000)),
     ]);
   },
 };
