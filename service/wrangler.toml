@@ -17,6 +17,7 @@ routes = [
 [[d1_databases]]
 binding = "DB"
 database_name = "numable-ccusage"
+# fork 后换成你自己的:npx wrangler d1 create numable-ccusage
 database_id = "30444857-bfbe-42aa-9fe0-58d4d460323f"
 migrations_dir = "migrations"
 
