@@ -13,8 +13,16 @@
 /plugin install numable-usage@numable
 ```
 
-跑完一次会话后，在 Claude Code 里运行 `/numable-usage` 取出**读取令牌**，
-粘贴到 Numable 的「我的 → 凭证」里，然后在商店安装「Claude Code 用量」信息源即可。
+装好后跑完一次 Claude Code 会话（插件会在会话开始/结束时采集），然后：
+
+1. 在 Claude Code 里运行 `/numable-usage`，复制它给出的**读取令牌**
+2. 打开 [Numable](https://numable.app) → 商店 → 装「Claude Code 用量」
+3. 我的 → 凭证管理 → 在「包的凭证槽」里点这个包的**「绑定」** → **「+ 新建凭证」**
+   → 粘贴令牌 → 保存（类型与域名已按包声明预填好，保存即完成绑定）
+4. 仪表盘 → ＋ → 选「Claude Code 用量」→ 挑卡
+
+> 第 3 步要从**槽位的「绑定」**进，不要从「+ 新建凭证」独立入口进 ——
+> 后者不会自动绑定，还得手选类型。
 
 ## 它上传什么
 
