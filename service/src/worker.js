@@ -243,6 +243,19 @@ function priceOf(name, v) {
   const k = /@fast$/.test(name) ? 2 : 1;
   return k * (v.in * p[0] + v.c5 * p[1] + v.c1 * p[2] + v.rd * p[3] + v.out * p[4]) / 1e6;
 }
+/** 按 token 类别拆开的费用（Token 构成页用）+ 缓存省下的钱：缓存读取若按普通输入计价要多付多少。表外模型跳过 */
+function costParts(m) {
+  const r = { in: 0, c5: 0, c1: 0, rd: 0, out: 0, saved: 0 };
+  for (const [name, v] of Object.entries(m || {})) {
+    const p = PRICES[baseModel(name).replace(/-\d{8}$/, '')];
+    if (!p) continue;
+    const k = (/@fast$/.test(name) ? 2 : 1) / 1e6;
+    r.in += v.in * p[0] * k; r.c5 += v.c5 * p[1] * k; r.c1 += v.c1 * p[2] * k; r.rd += v.rd * p[3] * k; r.out += v.out * p[4] * k;
+    r.saved += v.rd * (p[0] - p[3]) * k;
+  }
+  for (const f of Object.keys(r)) r[f] = r2(r[f]);
+  return { ...r, savedS: usdS(r.saved) };
+}
 /** 一组按模型明细的总价：{ usd, unpriced: 表外模型的输出 token 数 } */
 function costOfModels(m) {
   let usd = 0, unpriced = 0;
@@ -500,7 +513,7 @@ function insights(full, list, anchorDate, tot = {}) {
   const toolSum = Object.values(cur30.t).reduce((a, b) => a + b, 0);
   const tools = Object.entries(cur30.t).sort((a, b) => b[1] - a[1]).slice(0, 12)
     .map(([name, n]) => ({ name, n, pct: pct(n, toolSum), prev: prev30.t[name] || 0, chg: chg(n, prev30.t[name] || 0) }));
-  const composition = { ...cur30.comp, ...ratios(cur30.comp) };
+  const composition = { ...cur30.comp, ...ratios(cur30.comp), cost: costParts(cur30.m) };
   const compositionPrev = ratios(prev30.comp);
 
   // 近 30 天逐日（连续日期，没用的日子补 0）：每日图表 + 组件迷你柱。按模型拆费用，前 4 个模型单列、其余并成 other
@@ -523,8 +536,9 @@ function insights(full, list, anchorDate, tot = {}) {
       }
       usd += x.ws * WEB_SEARCH_USD;
       for (const [k, v] of Object.entries(parts)) partsAll[k] = (partsAll[k] || 0) + v;
+      // t = 这一天各工具的调用次数（工具详情页的逐日柱、这一天页的「用了哪些工具」）
       daily30.push({ d: date, usd: r2(usd), out: d ? d.out : 0, am: x.am, la: x.la, lr: x.lr, msgs: d ? d.msgs : 0,
-        v1: !!x.v1, parts });
+        v1: !!x.v1, parts, t: { ...x.t } });
     }
     daily30Models.push(...Object.entries(partsAll).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k]) => k));
     for (const row of daily30) {

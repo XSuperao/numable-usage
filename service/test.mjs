@@ -228,6 +228,8 @@ console.log('\n── 图表数据：逐日序列 / 迷你柱 / 变化值 ──
   ok(w.lines.add === '30' && w.lines.bars.length === 7 && w.lines.bars[6].t === 1, '代码改动：今天新增 + 7 根迷你柱');
   ok(w.tools[0].nz === 'Bash' && w.tools[0].v === 1 && w.tools[0].u === 2, '工具排行：首位满条、上一段为 0 不给方向');
   ok(w.vsAvg.fill >= 0 && w.vsAvg.fill <= 1 && w.vsAvg.mk >= 0 && w.vsAvg.mk <= 1, '今天 vs 日均：比例都在 0~1');
+  ok(m.daily30[29].t.Bash === 6 && m.daily30[20].t.Bash === 4 && Object.keys(m.daily30[28].t).length === 0, '✦ 逐日带各工具调用次数（工具详情页用）');
+  ok(m.composition.cost && m.composition.cost.out === 11 && m.composition.cost.saved === 0, `✦ 按 token 类别拆费用：输出 Opus 4e5 × $25/M + Sonnet 1e5 × $10/M = $11（${JSON.stringify(m.composition.cost)}）`);
 }
 
 console.log('\n── 体积与设备数上限 ──');
