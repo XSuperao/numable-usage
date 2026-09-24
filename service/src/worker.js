@@ -400,7 +400,7 @@ function mergeClaudeCode(list, anchor) {
     peakHour: peak ? Number(peak[0]) : -1,
     modelTop: models.length ? models[0].name : '',
     outMax: days.reduce((m, d) => Math.max(m, d.out), 0),
-    ...insights(full, list, anchorDate),
+    ...insights(full, list, anchorDate, tot),
   };
 }
 
@@ -409,7 +409,7 @@ function mergeClaudeCode(list, anchor) {
  * 全部以 anchorDate（看的人那天；老包 = 数据最后一天）为「今天」。日期都是采集机本地日期串，
  * 只做字符串比较与 UTC 纯日期运算，绝不按服务器时区换算。
  */
-function insights(full, list, anchorDate) {
+function insights(full, list, anchorDate, tot = {}) {
   const DAY = 864e5;
   const ms = (d) => Date.parse(d + 'T00:00:00Z');
   const iso = (t) => new Date(t).toISOString().slice(0, 10);
@@ -602,8 +602,223 @@ function insights(full, list, anchorDate) {
       lines: chg(a.la + a.lr, b.la + b.lr), msgs: chg(a.msgs, b.msgs) }];
   })) : null;
 
+  const w = anchorDate && periods ? widgetsView({ anchorDate, back, agg, full, tot, periods, months, costModels,
+    tools, composition, compositionPrev, punch, punchMax, sessions, projects, daily30, daily30Models, deltas }) : null;
+
   return { periods, months, best, costModels, tools, composition, compositionPrev, punch, punchMax, window, sessions,
-    projects, daily30, daily30Models, costBars, deltas };
+    projects, daily30, daily30Models, costBars, deltas, w };
+}
+
+/* ─────────────── 组件视图 w（2026-09-24 组件扩充） ───────────────
+ * 组件的取数流（VParser）只会取值，RCN 坐标只会乘加 —— 所以这里把每个组件要的东西**直接算成能画的样子**：
+ *   · 显示串（美元 / k·M / 变化「↑12%」「↑4.4×」）全在这儿格式化，端上零计算；
+ *   · 柱 / 条一律给 0~1 的比例，外加 u = 1 − v（RCN 写不了「常量 − 数据变量」，见 memory rcn-dsl-pitfalls）；
+ *   · 颜色直接给「浅|深」paint 串，模型色与页面同一套钉槽（PIN），颜色跟模型走、不随排名换；
+ *   · 涨跌方向 u：1 涨 / 0 跌 / 2 没有可比的上一段（不画胶囊）。
+ * 需要按语言变的文字（单位、「点」、行名）不在这儿拼，留给 RCN 的 @i18n。
+ */
+const PAL = ['#2a78d6|#3987e5', '#eb6834|#d95926', '#1baf7a|#199e70', '#eda100|#c98500', '#e87ba4|#d55181'];
+const PAL_OTHER = '#B8BDC6|#4B5059';
+const PIN = { 'claude-opus-5': 0, 'claude-fable-5': 1, 'claude-fable-5-1': 2, 'claude-opus-5-5': 3, 'claude-sonnet-5': 4 };
+const TOOL_ZH = { Agent: '子代理', Todo: '待办', Other: '其他', AskUserQuestion: '向你提问', ToolSearch: '查找工具',
+  WebSearch: '联网搜索', WebFetch: '抓取网页', ExitPlanMode: '计划模式', EnterPlanMode: '计划模式', NotebookEdit: '改笔记本',
+  Skill: '技能', SlashCommand: '命令' };
+const TOOL_EN = { Agent: 'Agents', Todo: 'To-dos', Other: 'Other', AskUserQuestion: 'Asked you', ToolSearch: 'Tool search',
+  WebSearch: 'Web search', WebFetch: 'Web fetch', ExitPlanMode: 'Plan mode', EnterPlanMode: 'Plan mode', NotebookEdit: 'Notebooks',
+  Skill: 'Skills', SlashCommand: 'Commands' };
+const fmtK = (n) => {
+  n = Number(n) || 0;
+  if (n >= 1e6) return Math.round(n / 1e5) / 10 + 'M';
+  if (n >= 1e3) return Math.round(n / 1e2) / 10 + 'k';
+  return String(Math.round(n));
+};
+/** 模型短名（与页面 mlabel 同规则）：claude-fable-5-1 → Fable 5.1；小版本只认 1~2 位（8 位的是发布日期） */
+const mlabel = (n) => {
+  if (n === 'other') return 'Other';
+  const m = /^claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d{1,2})(?!\d))?/.exec(String(n || ''));
+  if (!m) return String(n || '').replace(/^claude-/, '');
+  return m[1][0].toUpperCase() + m[1].slice(1) + ' ' + m[2] + (m[3] ? '.' + m[3] : '');
+};
+/** 变化串：与页面 chipOf 同规则 —— 超过 +200% 改说倍数 */
+const chgS = (c) => {
+  if (!c || c.p == null) return '';
+  if (c.p >= 200) { const x = 1 + c.p / 100; return '↑' + (x >= 10 ? Math.round(x) : Math.round(x * 10) / 10) + '×'; }
+  return c.s;
+};
+const chgU = (c) => (c && c.p != null ? (c.p >= 0 ? 1 : 0) : 2);
+const r3 = (x) => Math.round(x * 1000) / 1000;
+/** 纵轴顶：与页面 niceMax 同一套档位 */
+const niceMax = (mx) => {
+  if (!(mx > 0)) return 0;
+  const e = 10 ** Math.floor(Math.log10(mx)), f = mx / e;
+  for (const s of [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]) if (f <= s) return s * e;
+  return 10 * e;
+};
+/** 迷你柱：按本段峰值归一，有值的至少 0.06（看得见）；t = 最后一根（今天） */
+const miniBars = (vals) => {
+  const mx = Math.max(0, ...vals);
+  return vals.map((x, i) => {
+    const v = mx > 0 && x > 0 ? Math.max(0.06, x / mx) : 0;
+    return { i, v: r3(v), u: r3(1 - v), t: i === vals.length - 1 ? 1 : 0 };
+  });
+};
+const hm = (min) => { min = Math.max(0, Math.round(Number(min) || 0)); return { h: Math.floor(min / 60), m: min % 60 }; };
+/** 小时数显示：不到 10 小时保留一位小数 */
+/** 坐标轴标签：整数不带小数（$6 而不是 $6.00） */
+const usdAxis = (v) => (v >= 100 || !Number.isInteger(v) ? usdS(v) : '$' + v);
+const hrs = (min) => { const h = (Number(min) || 0) / 60; return String(h >= 10 ? Math.round(h) : Math.round(h * 10) / 10); };
+
+function widgetsView(I) {
+  const { anchorDate, back, agg, full, tot, periods, months, costModels, tools, composition, compositionPrev,
+    punch, punchMax, sessions, projects, daily30, daily30Models, deltas } = I;
+
+  // 模型配色：与页面 buildColors 同一算法（钉槽优先，其余按顺序占空槽，占满了一律灰）
+  const colorOf = (() => {
+    const names = [...daily30Models, ...costModels.map((x) => x.name)];
+    const col = {}, used = new Set();
+    for (const n of names) if (n in PIN) { col[n] = PAL[PIN[n]]; used.add(PIN[n]); }
+    for (const n of names) {
+      if (col[n] || n === 'other') continue;
+      for (let s = 0; s < PAL.length; s++) if (!used.has(s)) { used.add(s); col[n] = PAL[s]; break; }
+    }
+    return (n) => col[n] || PAL_OTHER;
+  })();
+  const md = (d) => String(d || '').slice(5);
+  const past = daily30.slice(0, -1);                          // 不含今天（还没过完，算进基线会拉低）
+  const avgOf = (f) => { const v = past.map(f).filter((x) => x > 0); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : 0; };
+
+  // ── 每日趋势：近 30 天费用，按模型堆叠 ──
+  const trendMax = niceMax(Math.max(0, ...daily30.map((r) => r.usd)));
+  const order = [...daily30Models, 'other'];
+  const segs = [];
+  if (trendMax > 0) {
+    daily30.forEach((r, i) => {
+      let b = 0;
+      for (const k of order) {
+        const v = Number(r.parts[k]) || 0;
+        if (!(v > 0)) continue;
+        const h = v / trendMax;
+        segs.push({ i, h: r3(h), u: r3(1 - b - h), c: k === 'other' ? PAL_OTHER : colorOf(k) });
+        b += h;
+      }
+    });
+  }
+  const usdAvg = avgOf((r) => r.usd);
+  const legend = order.filter((k) => daily30.some((r) => Number(r.parts[k]) > 0)).slice(0, 5)
+    .map((k, i) => ({ i, n: mlabel(k), c: k === 'other' ? PAL_OTHER : colorOf(k) }));
+  const trend = {
+    segs, legend, maxS: usdAxis(trendMax), avgU: trendMax > 0 ? r3(1 - usdAvg / trendMax) : 1, avgS: usdS(r2(usdAvg)),
+    hasAvg: usdAvg > 0 ? 1 : 0, from: md(daily30[0] && daily30[0].d), to: md(anchorDate),
+    d7: periods.d7.usdS, d7C: chgS(deltas.d7.usd), d7U: chgU(deltas.d7.usd),
+  };
+
+  // ── 本月账单：本月至今 vs 上月同期（同样多的天数），外加「已到上月全月的多少」──
+  const dom = Number(anchorDate.slice(8, 10));
+  const pmLastDay = Number(months.prev.ym ? new Date(Date.UTC(+months.prev.ym.slice(0, 4), +months.prev.ym.slice(5, 7), 0)).getUTCDate() : 30);
+  const samePrev = agg(`${months.prev.ym}-01`, `${months.prev.ym}-${String(Math.min(dom, pmLastDay)).padStart(2, '0')}`);
+  const mc = chg(months.cur.usd, samePrev.usd);
+  const monthDays = new Date(Date.UTC(+anchorDate.slice(0, 4), +anchorDate.slice(5, 7), 0)).getUTCDate();
+  const month = {
+    cur: months.cur.usdS, prev: months.prev.usdS, same: usdS(samePrev.usd), m: +anchorDate.slice(5, 7), pm: +months.prev.ym.slice(5, 7),
+    c: chgS(mc), u: chgU(mc),
+    fill: months.prev.usd > 0 ? r3(Math.min(1, months.cur.usd / months.prev.usd)) : 0,
+    ofPrev: months.prev.usd > 0 ? Math.round((months.cur.usd / months.prev.usd) * 100) : -1,
+    day: dom, days: monthDays, dayFill: r3(dom / monthDays),
+  };
+
+  // ── 今天 vs 日均（近 30 天有用量的日子，不含今天）── 刻度 = 0 ~ max(今天, 日均)
+  const tUsd = periods.today.usd;
+  const top = Math.max(tUsd, usdAvg);
+  const vsAvg = {
+    today: periods.today.usdS, avg: usdS(r2(usdAvg)),
+    fill: top > 0 ? r3(tUsd / top) : 0, mk: top > 0 ? r3(usdAvg / top) : 0, has: usdAvg > 0 ? 1 : 0,
+    pct: usdAvg > 0 ? Math.round((tUsd / usdAvg) * 100) : -1,
+  };
+
+  // ── 周期对比表：今天 / 近 7 天 / 近 30 天 × 费用 / 输出 / 活跃（小时）──
+  const row = (a, d) => ({
+    usd: a.usdS, usdC: d ? chgS(d.usd) : '', usdU: d ? chgU(d.usd) : 2,
+    out: fmtK(a.out), outC: d ? chgS(d.out) : '', outU: d ? chgU(d.out) : 2,
+    am: hrs(a.am), amC: d ? chgS(d.am) : '', amU: d ? chgU(d.am) : 2,
+  });
+  const per = { r0: row(periods.today, null), r1: row(periods.d7, deltas.d7), r2: row(periods.d30, deltas.d30) };
+
+  // ── 连续打卡：近 14 天点阵 ──
+  const active = new Set(full.filter((d) => d.out > 0 || d.msgs > 0).map((d) => d.date));
+  const streak = {
+    n: tot.streak || 0, longest: tot.longestStreak || 0,
+    dots: Array.from({ length: 14 }, (_, i) => ({ i, on: active.has(back(13 - i)) ? 1 : 0, t: i === 13 ? 1 : 0 })),
+    todayOn: active.has(anchorDate) ? 1 : 0,
+  };
+
+  // ── 作息打卡图：7 行（周一在上）× 24 列，五档 ──
+  const cells = [];
+  let peakH = -1, peakV = 0;
+  const byHour = new Array(24).fill(0);
+  for (let wd = 0; wd < 7; wd++) {
+    for (let h = 0; h < 24; h++) {
+      const v = punch[wd * 24 + h];
+      byHour[h] += v;
+      const l = v <= 0 || !(punchMax > 0) ? 0 : Math.min(4, Math.max(1, Math.ceil((v / punchMax) * 4)));
+      cells.push({ x: h, y: (wd + 6) % 7, l });
+    }
+  }
+  byHour.forEach((v, h) => { if (v > peakV) { peakV = v; peakH = h; } });
+  const punchW = { cells, peak: peakH >= 0 ? String(peakH).padStart(2, '0') + ':00' : '', has: punchMax > 0 ? 1 : 0 };
+
+  // ── 活跃时长：今天 + 近 7 天迷你柱 + 7 天日均（按有用量的日子）──
+  const last7 = daily30.slice(-7);
+  const tAm = hm(periods.today.am);
+  const activeW = {
+    h: tAm.h, m: tAm.m, bars: miniBars(last7.map((r) => r.am)),
+    avg: periods.d7.days ? hrs(periods.d7.am / periods.d7.days) : '', c: chgS(deltas.d7.am), u: chgU(deltas.d7.am),
+    sum7: hrs(periods.d7.am),
+  };
+
+  // ── 会话习惯 ──
+  const sa = hm(sessions.avgMin), sx = hm(sessions.maxMin);
+  const sess = { ah: sa.h, am: sa.m, xh: sx.h, xm: sx.m, n: sessions.n, today: periods.today.sessions, d7: periods.d7.sessions };
+
+  // ── 代码改动：今天 + 近 7 天迷你柱 ──
+  const lines = {
+    add: fmtK(periods.today.la), del: fmtK(periods.today.lr), bars: miniBars(last7.map((r) => (r.la || 0) + (r.lr || 0))),
+    sum7: fmtK(periods.d7.la + periods.d7.lr), add7: fmtK(periods.d7.la), del7: fmtK(periods.d7.lr),
+    c: chgS(deltas.d7.lines), u: chgU(deltas.d7.lines),
+  };
+
+  // ── 工具排行：前 5（近 30 天调用次数；变化对比前 30 天）──
+  const t5 = tools.slice(0, 5), tMax = t5.length ? t5[0].n : 0;
+  const toolsW = t5.map((x, i) => ({
+    i, nz: TOOL_ZH[x.name] || x.name, ne: TOOL_EN[x.name] || x.name, n: fmtK(x.n),
+    v: tMax > 0 ? r3(Math.max(0.02, x.n / tMax)) : 0, c: chgS(x.chg), u: chgU(x.chg),
+  }));
+
+  // ── 缓存与思考：比例的变化说「点」（98% → 99% 是 +1 点，不是 +1%）──
+  const pt = (a, b) => {
+    if (b == null || !isFinite(b)) return { s: '', u: 2 };
+    const d = Math.round((a - b) * 10) / 10;
+    return { s: (d >= 0 ? '↑' : '↓') + Math.abs(d), u: d >= 0 ? 1 : 0 };
+  };
+  const cp = compositionPrev || {};
+  const hasPrev = (cp.hitRate || 0) > 0 || (cp.thinkPct || 0) > 0;
+  const mk = (k) => { const d = hasPrev ? pt(composition[k], cp[k]) : { s: '', u: 2 }; return { v: Math.round(composition[k] || 0) + '%', c: d.s, u: d.u }; };
+  const cache = { hit: mk('hitRate'), think: mk('thinkPct'), side: mk('sidePct') };
+
+  // ── 项目分布：前 5（默认只有编号；打开开关的人才有名字）──
+  const p5 = projects.slice(0, 5), pMax = p5.length ? p5[0].out : 0;
+  const projW = p5.map((p, i) => ({
+    i, n: p.name || '', l: String.fromCharCode(65 + i), p: Math.round(p.pct) + '%', o: fmtK(p.out),
+    v: pMax > 0 ? r3(Math.max(0.02, p.out / pMax)) : 0,
+  }));
+
+  // ── 费用中号：近 30 天费用按模型的前 3 ──
+  const cm3 = costModels.slice(0, 3).map((x, i) => ({ i, n: mlabel(x.name), s: x.unpriced && !x.usd ? '--' : usdS(x.usd), p: Math.round(x.pct) + '%', c: colorOf(x.name) }));
+
+  return {
+    trend, month, vsAvg, per, streak, punch: punchW, active: activeW, sess, lines, tools: toolsW, cache, proj: projW,
+    cost: { d30C: chgS(deltas.d30.usd), d30U: chgU(deltas.d30.usd), d7U: chgU(deltas.d7.usd), models: cm3, month: months.cur.usdS },
+    nTools: toolsW.length, nProj: projW.length,
+  };
 }
 
 // ─────────────────────────── 路由 ───────────────────────────

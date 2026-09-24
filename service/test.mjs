@@ -212,6 +212,22 @@ console.log('\n── 图表数据：逐日序列 / 迷你柱 / 变化值 ──
   const bash = m.tools.find((t) => t.name === 'Bash');
   ok(bash.n === 10 && bash.prev === 0, `工具带上一段次数（近 30 天 4+6=10，上一段 0）`);
   ok(m.compositionPrev && 'hitRate' in m.compositionPrev, '上一段的 token 构成');
+
+  // 组件视图 w（2026-09-24）：一切都已是能直接画的样子
+  const w = m.w;
+  ok(w && w.trend && w.per && w.streak && w.punch && w.tools, '✦ 组件视图 w 存在');
+  ok(w.trend.d7C === '↑3.4×' && w.trend.d7U === 1, `✦ 变化超过 +200% 改说倍数（${w.trend.d7C}）`);
+  ok(w.per.r1.usdC === '↑3.4×' && w.per.r0.usdC === '' && w.per.r0.usdU === 2, '周期表：今天那行不给变化，方向 2 = 不画');
+  const s27 = w.trend.segs.filter((x) => x.i === 27);
+  ok(s27.length === 2 && s27[0].c === '#2a78d6|#3987e5' && Math.abs(s27[0].h + s27[1].h + s27[1].u - 1) < 0.002,
+    `✦ 趋势堆叠：两段、Opus 5 钉第一槽、顶段 u = 1 − 累计高（${JSON.stringify(s27)}）`);
+  ok(w.trend.maxS === '$6' && w.trend.segs.every((x) => x.u >= -0.001 && x.u <= 1), `纵轴顶按档位取整（${w.trend.maxS}）`);
+  ok(w.streak.dots.length === 14 && w.streak.dots[13].on === 1 && w.streak.dots[12].on === 0 && w.streak.dots[11].on === 1,
+    `✦ 打卡点阵：近 14 天，今天在最右（${w.streak.dots.map((d) => d.on).join('')}）`);
+  ok(w.punch.cells.length === 168 && w.punch.cells.every((c) => c.l >= 0 && c.l <= 4), '打卡图 168 格、五档');
+  ok(w.lines.add === '30' && w.lines.bars.length === 7 && w.lines.bars[6].t === 1, '代码改动：今天新增 + 7 根迷你柱');
+  ok(w.tools[0].nz === 'Bash' && w.tools[0].v === 1 && w.tools[0].u === 2, '工具排行：首位满条、上一段为 0 不给方向');
+  ok(w.vsAvg.fill >= 0 && w.vsAvg.fill <= 1 && w.vsAvg.mk >= 0 && w.vsAvg.mk <= 1, '今天 vs 日均：比例都在 0~1');
 }
 
 console.log('\n── 体积与设备数上限 ──');
