@@ -258,6 +258,12 @@ const r2 = (x) => Math.round(x * 100) / 100;
 const usdS = (v) => (v == null || !isFinite(v) ? '--' : v === 0 ? '$0' : v < 0.01 ? '<$0.01'
   : '$' + (v < 100 ? v.toFixed(2) : Math.round(v).toLocaleString('en-US')));
 const pct = (a, b) => (b > 0 ? Math.round((a / b) * 1000) / 10 : 0);
+/** 变化：{ p: 百分比整数 | null, s: '↑12%' / '↓8%' / '' }。上一段为 0 时 p = null、s = ''。 */
+const chg = (cur, prev) => {
+  if (!(prev > 0)) return { p: null, s: '' };
+  const p = Math.round(((cur - prev) / prev) * 100);
+  return { p, s: (p >= 0 ? '↑' : '↓') + Math.abs(p) + '%' };
+};
 
 /**
  * 多设备合并成一份（同一个人的多台机器应该看成一份用量）。
@@ -449,41 +455,96 @@ function insights(full, list, anchorDate) {
   for (const d of full) if (!best || d.out > best.out) best = d;
   best = best && best.out > 0 ? { date: best.date, out: best.out, usd: r2(costOfModels(X(best).m).usd) } : null;
 
-  // 近 30 天：费用按模型 / 工具 / token 构成 / 活跃
-  const from30 = anchorDate ? back(29) : '';
-  const m30 = {}, t30 = {};
-  const comp = { out: 0, in: 0, c5: 0, c1: 0, rd: 0, th: 0, so: 0 };
-  for (const d of full) {
-    if (!anchorDate || d.date < from30 || d.date > anchorDate) continue;
-    const x = X(d);
-    for (const [k, v] of Object.entries(x.m)) {
-      const b = m30[k] || (m30[k] = { in: 0, out: 0, c5: 0, c1: 0, rd: 0, n: 0 });
-      for (const f of ['in', 'out', 'c5', 'c1', 'rd', 'n']) b[f] += v[f];
+  // 一段日期里：按模型的 token 明细 / 工具次数 / token 构成
+  const window3 = (from, to) => {
+    const m = {}, t = {};
+    const comp = { out: 0, in: 0, c5: 0, c1: 0, rd: 0, th: 0, so: 0 };
+    for (const d of full) {
+      if (!anchorDate || d.date < from || d.date > to) continue;
+      const x = X(d);
+      for (const [k, v] of Object.entries(x.m)) {
+        const b = m[k] || (m[k] = { in: 0, out: 0, c5: 0, c1: 0, rd: 0, n: 0 });
+        for (const f of ['in', 'out', 'c5', 'c1', 'rd', 'n']) b[f] += v[f];
+      }
+      for (const [k, v] of Object.entries(x.t)) t[k] = (t[k] || 0) + v;
+      comp.out += d.out; comp.in += d.in; comp.c1 += x.c1; comp.c5 += Math.max(0, d.cacheCreate - x.c1);
+      comp.rd += x.rd; comp.th += x.th; comp.so += x.so;
     }
-    for (const [k, v] of Object.entries(x.t)) t30[k] = (t30[k] || 0) + v;
-    comp.out += d.out; comp.in += d.in; comp.c1 += x.c1; comp.c5 += Math.max(0, d.cacheCreate - x.c1);
-    comp.rd += x.rd; comp.th += x.th; comp.so += x.so;
-  }
-  const byBase = {};
-  for (const [k, v] of Object.entries(m30)) {
-    const c = priceOf(k, v);
-    const b = byBase[baseModel(k)] || (byBase[baseModel(k)] = { name: baseModel(k), usd: 0, unpriced: false, fast: 0 });
-    if (c === null) b.unpriced = true; else b.usd += c;
-    if (/@fast$/.test(k)) b.fast += v.out;
-  }
-  const costSum = Object.values(byBase).reduce((a, b) => a + b.usd, 0);
-  const costModels = Object.values(byBase).sort((a, b) => b.usd - a.usd).slice(0, 6)
-    .map((b) => ({ name: b.name, usd: r2(b.usd), pct: pct(b.usd, costSum), unpriced: b.unpriced, fastOut: b.fast }));
-  const toolSum = Object.values(t30).reduce((a, b) => a + b, 0);
-  const tools = Object.entries(t30).sort((a, b) => b[1] - a[1]).slice(0, 12)
-    .map(([name, n]) => ({ name, n, pct: pct(n, toolSum) }));
-  const inputSide = comp.in + comp.c5 + comp.c1 + comp.rd;
-  const composition = {
-    ...comp,
-    hitRate: pct(comp.rd, inputSide),           // 送进模型的上下文里有多少是缓存命中
-    thinkPct: pct(comp.th, comp.out),
-    sidePct: pct(comp.so, comp.out),
+    return { m, t, comp };
   };
+  const byBaseUsd = (m) => {
+    const r = {};
+    for (const [k, v] of Object.entries(m)) {
+      const c = priceOf(k, v);
+      const b = r[baseModel(k)] || (r[baseModel(k)] = { usd: 0, unpriced: false, fast: 0 });
+      if (c === null) b.unpriced = true; else b.usd += c;
+      if (/@fast$/.test(k)) b.fast += v.out;
+    }
+    return r;
+  };
+  const ratios = (c) => {
+    const inputSide = c.in + c.c5 + c.c1 + c.rd;
+    return { hitRate: pct(c.rd, inputSide), thinkPct: pct(c.th, c.out), sidePct: pct(c.so, c.out) };
+  };
+  const cur30 = window3(anchorDate ? back(29) : '', anchorDate);
+  const prev30 = window3(anchorDate ? back(59) : '', anchorDate ? back(30) : '');
+
+  const byBase = byBaseUsd(cur30.m), byBasePrev = byBaseUsd(prev30.m);
+  const costSum = Object.values(byBase).reduce((a, b) => a + b.usd, 0);
+  const costModels = Object.entries(byBase).sort((a, b) => b[1].usd - a[1].usd).slice(0, 6)
+    .map(([name, b]) => {
+      const prev = byBasePrev[name] ? byBasePrev[name].usd : 0;
+      return { name, usd: r2(b.usd), pct: pct(b.usd, costSum), unpriced: b.unpriced, fastOut: b.fast,
+        prevUsd: r2(prev), chg: chg(b.usd, prev) };
+    });
+  const toolSum = Object.values(cur30.t).reduce((a, b) => a + b, 0);
+  const tools = Object.entries(cur30.t).sort((a, b) => b[1] - a[1]).slice(0, 12)
+    .map(([name, n]) => ({ name, n, pct: pct(n, toolSum), prev: prev30.t[name] || 0, chg: chg(n, prev30.t[name] || 0) }));
+  const composition = { ...cur30.comp, ...ratios(cur30.comp) };
+  const compositionPrev = ratios(prev30.comp);
+
+  // 近 30 天逐日（连续日期，没用的日子补 0）：每日图表 + 组件迷你柱。按模型拆费用，前 4 个模型单列、其余并成 other
+  const daily30 = [];
+  const daily30Models = [];
+  if (anchorDate) {
+    const byDate = new Map(full.map((d) => [d.date, d]));
+    const partsAll = {};
+    for (let i = 29; i >= 0; i--) {
+      const date = back(i);
+      const d = byDate.get(date);
+      const x = d ? X(d) : x0;
+      const parts = {};
+      let usd = 0;
+      for (const [k, v] of Object.entries(x.m)) {
+        const c = priceOf(k, v);
+        if (c === null) continue;
+        parts[baseModel(k)] = (parts[baseModel(k)] || 0) + c;
+        usd += c;
+      }
+      usd += x.ws * WEB_SEARCH_USD;
+      for (const [k, v] of Object.entries(parts)) partsAll[k] = (partsAll[k] || 0) + v;
+      daily30.push({ d: date, usd: r2(usd), out: d ? d.out : 0, am: x.am, la: x.la, lr: x.lr, msgs: d ? d.msgs : 0,
+        v1: !!x.v1, parts });
+    }
+    daily30Models.push(...Object.entries(partsAll).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k]) => k));
+    for (const row of daily30) {
+      const p = {};
+      let other = 0;
+      for (const [k, v] of Object.entries(row.parts)) {
+        if (daily30Models.includes(k)) p[k] = r2(v); else other += v;
+      }
+      if (other > 0) p.other = r2(other);
+      row.parts = p;
+    }
+  }
+  // 组件的 14 天迷你柱：高度按本段峰值归一。v = 柱高占比（有用量的日子至少 0.06，看得见），u = 1 - v（柱顶的留白）；
+  // 给两份是因为 RCN 坐标里写不了「常量 − 数据变量」（memory rcn-dsl-pitfalls），只能乘加
+  const last14 = daily30.slice(-14);
+  const mx14 = Math.max(0, ...last14.map((r) => r.usd));
+  const costBars = last14.map((r, i) => {
+    const v = mx14 > 0 && r.usd > 0 ? Math.max(0.06, r.usd / mx14) : 0;
+    return { i, v: Math.round(v * 1000) / 1000, u: Math.round((1 - v) * 1000) / 1000, t: i === last14.length - 1 ? 1 : 0 };
+  });
 
   // 星期 × 小时（真人发言）：index = 星期(0=周日) × 24 + 小时；近 90 天
   const punch = new Array(168).fill(0);
@@ -527,12 +588,22 @@ function insights(full, list, anchorDate) {
   const sessions = { n: sn, avgMin: sn ? Math.round(ssum / sn) : 0, maxMin: smax };
 
   // 项目：各设备的项目编号互不相通（盐按设备），直接拼起来按用量排
-  const projects = list.flatMap((s) => s.projects || []).sort((a, b) => b.tok - a.tok).slice(0, 10)
+  // 排序与占比都按**输出** token —— 与整页的主指标同一个量；按总量（含缓存读取）排，
+  // 右边显示的输出数会和排序对不上（缓存读取常是输出的数百倍，完全淹没差异）
+  const projects = list.flatMap((s) => s.projects || []).sort((a, b) => b.out - a.out).slice(0, 10)
     .map((p) => ({ id: p.id, name: p.name || null, out: p.out, tok: p.tok, n: p.n, d7out: p.d7out }));
-  const projTok = projects.reduce((a, p) => a + p.tok, 0);
-  for (const p of projects) p.pct = pct(p.tok, projTok);
+  const projOut = projects.reduce((a, p) => a + p.out, 0);
+  for (const p of projects) p.pct = pct(p.out, projOut);
 
-  return { periods, months, best, costModels, tools, composition, punch, punchMax, window, sessions, projects };
+  // 变化值：近 7 / 30 天与上一段等长的日子比。上一段是 0 → 不给（除以 0 出来的「+∞%」没有意义）
+  const deltas = periods ? Object.fromEntries(['d7', 'd30'].map((k) => {
+    const a = periods[k], b = periods[k + 'p'];
+    return [k, { usd: chg(a.usd, b.usd), out: chg(a.out, b.out), am: chg(a.am, b.am),
+      lines: chg(a.la + a.lr, b.la + b.lr), msgs: chg(a.msgs, b.msgs) }];
+  })) : null;
+
+  return { periods, months, best, costModels, tools, composition, compositionPrev, punch, punchMax, window, sessions,
+    projects, daily30, daily30Models, costBars, deltas };
 }
 
 // ─────────────────────────── 路由 ───────────────────────────

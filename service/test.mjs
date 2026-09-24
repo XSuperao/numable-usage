@@ -169,7 +169,7 @@ console.log('\n── v2 快照：费用 / 周期 / 打卡 / 工具 / 构成 / �
   ok(m.costModels[0].name === 'claude-opus-5' && m.costModels[0].usd === 24 && m.costModels[0].fastOut === 1e5,
     `✦ 按模型费用把快速模式并回同一模型（${JSON.stringify(m.costModels[0])}）`);
   ok(m.models.every((x) => !/@fast/.test(x.name)), '模型分布里没有 @fast 行');
-  ok(JSON.stringify(m.tools) === JSON.stringify([{ name: 'Bash', n: 5, pct: 71.4 }, { name: 'Edit', n: 2, pct: 28.6 }]),
+  ok(JSON.stringify(m.tools.map(({ name, n, pct }) => ({ name, n, pct }))) === JSON.stringify([{ name: 'Bash', n: 5, pct: 71.4 }, { name: 'Edit', n: 2, pct: 28.6 }]),
     `✦ 工具排行（非法工具名被白名单丢掉）${JSON.stringify(m.tools)}`);
   const wd = new Date(D0 + 'T00:00:00Z').getUTCDay();
   ok(m.punch.length === 168 && m.punch[wd * 24 + 9] === 3 && m.punchMax === 3, '✦ 打卡图按日期推星期几，非法小时键被丢');
@@ -183,6 +183,35 @@ console.log('\n── v2 快照：费用 / 周期 / 打卡 / 工具 / 构成 / �
   ok(dd.usd === 24.03 && dd.am === 95 && dd.la === 40 && od.usd === null, `✦ 逐日带费用 / 活跃 / 改动，老插件那天费用为 null（${dd.usd} / ${od.usd}）`);
   const old = (await J('/s', { headers: { authorization: 'Bearer ' + R3 } })).j;
   ok(Array.isArray(old.sources['claude-code']) && old.merged.today.date === D0, '不带 lite / today 的老调用照旧');
+}
+
+console.log('\n── 图表数据：逐日序列 / 迷你柱 / 变化值 ──');
+{
+  const iso = (off) => new Date(Date.now() + off * 864e5).toISOString().slice(0, 10);
+  const D0 = iso(0);
+  const sp4 = await post('/space');
+  const W4 = sp4.j.writeToken, R4 = sp4.j.readToken;
+  const M = (o) => ({ in: 0, out: 0, c5: 0, c1: 0, rd: 0, n: 1, ...o });
+  const day = (date, m, extra = {}) => ({ date, msgs: 1, sessions: 1, out: 1, in: 0, cacheCreate: 0, m, t: {}, h: {}, ...extra });
+  await post('/ingest', { source: 'claude-code', device: 'dddd0001', snapshot: { v: 2, days: [
+    day(iso(-9), { 'claude-opus-5': M({ out: 1e5 }) }, { t: { Bash: 4 }, la: 10 }),         // 上一段：$2.5
+    day(iso(-2), { 'claude-opus-5': M({ out: 2e5 }), 'claude-sonnet-5': M({ out: 1e5 }) }), // $5 + $1
+    day(D0, { 'claude-opus-5': M({ out: 1e5 }) }, { t: { Bash: 6 }, la: 30 }),              // $2.5
+  ] } }, W4);
+  const m = (await J(`/s?today=${D0}&lite=1`, { headers: { authorization: 'Bearer ' + R4 } })).j.merged;
+  ok(m.daily30.length === 30 && m.daily30[29].d === D0 && m.daily30[0].d === iso(-29), '✦ 逐日序列：连续 30 天，最后一天是今天');
+  ok(m.daily30[28].usd === 0 && m.daily30[27].usd === 6, '没用的日子补 0；按天费用正确');
+  ok(JSON.stringify(m.daily30[27].parts) === JSON.stringify({ 'claude-opus-5': 5, 'claude-sonnet-5': 1 }), `✦ 按模型拆费用（${JSON.stringify(m.daily30[27].parts)}）`);
+  ok(m.daily30Models[0] === 'claude-opus-5', '模型顺序按 30 天费用');
+  const cb = m.costBars;
+  ok(cb.length === 14 && cb[13].t === 1 && cb[11].v === 1 && cb[11].u === 0 && cb[13].v === 0.417 && cb[12].v === 0,
+    `✦ 迷你柱：14 根、峰值归一、今天标记、没用的日子高 0（${JSON.stringify(cb.slice(11))}）`);
+  ok(m.deltas.d7.usd.s === '↑240%' && m.deltas.d7.usd.p === 240, `✦ 近 7 天费用 vs 前 7 天：8.5 vs 2.5 = ↑240%（${JSON.stringify(m.deltas.d7.usd)}）`);
+  ok(m.deltas.d7.lines.s === '↑200%', `改动行变化（${m.deltas.d7.lines.s}）`);
+  ok(m.deltas.d30.usd.s === '' && m.deltas.d30.usd.p === null, '✦ 上一段为 0 → 不给变化值（不出 +∞%）');
+  const bash = m.tools.find((t) => t.name === 'Bash');
+  ok(bash.n === 10 && bash.prev === 0, `工具带上一段次数（近 30 天 4+6=10，上一段 0）`);
+  ok(m.compositionPrev && 'hitRate' in m.compositionPrev, '上一段的 token 构成');
 }
 
 console.log('\n── 体积与设备数上限 ──');
