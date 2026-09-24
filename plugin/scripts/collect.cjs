@@ -475,7 +475,9 @@ async function cmdDevices() {
 
   const local = loadHistory().days;
   const ghosts = [];
-  console.log(`你的空间里有 ${list.length} 台设备在推送用量（App 会把它们的数字加在一起）：\n`);
+  console.log(list.length === 1
+    ? '你的空间里只有 1 台设备在推送用量：\n'
+    : `你的空间里有 ${list.length} 台设备在推送用量（App 会把它们的数字加在一起）：\n`);
   for (const dev of list) {
     const days = (dev.days || []).map((d) => d.date).sort();
     const t = dev.totals || {};
@@ -487,7 +489,7 @@ async function cmdDevices() {
       const g = ghostOf(local, dev.days);
       if (g.likely) {
         ghosts.push(dev.device);
-        console.log(`    ⚠ 与本机有 ${g.overlap} 天重叠，其中 ${g.same} 天的会话数完全相同 ——` +
+        console.log(`    ⚠ 与本机有 ${g.overlap} 天重叠，其中 ${g.same} 天的会话数完全相同——` +
                     '多半是这台电脑改名前留下的旧记录，这些天的用量被算了两遍。');
       }
     }
