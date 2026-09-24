@@ -15,7 +15,7 @@
  *   GET  /health
  */
 
-const MAX_BODY = 64 * 1024;        // 单快照上限
+const MAX_BODY = 256 * 1024;       // 单快照上限（v2 快照带逐日按模型 / 工具 / 小时明细，实测 90 天 ≈ 40KB）
 const MAX_ROWS_PER_SPACE = 20;     // source × device
 const CODE_TTL_MS = 5 * 60 * 1000;
 const KEEP_MS = 90 * 864e5;
@@ -98,7 +98,26 @@ async function allow(env, key, limit, windowMs = 60000) {
 const int = (v, max = 2 ** 53 - 1) =>
   typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.min(Math.floor(v), max) : 0;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const MODEL_RE = /^[a-zA-Z0-9._-]{1,64}$/;
+const MODEL_RE = /^[a-zA-Z0-9._-]{1,64}(@fast)?$/;   // @fast = 快速模式（同一模型，单价翻倍）
+const TOOL_RE = /^[A-Za-z]{1,24}$/;
+const PROJ_RE = /^[a-f0-9]{8,16}$/;
+/** 逐项白名单构造的 {键: 非负整数} 表 */
+const intMap = (o, keyOk, max = 64) => {
+  const r = {};
+  if (!o || typeof o !== 'object') return r;
+  for (const [k, v] of Object.entries(o).slice(0, max)) if (keyOk(k)) r[k] = int(v);
+  return r;
+};
+const hourKey = (k) => { const h = Number(k); return Number.isInteger(h) && h >= 0 && h <= 23 && String(h) === k; };
+const modelTok = (v) => ({ in: int(v.in), out: int(v.out), c5: int(v.c5), c1: int(v.c1), rd: int(v.rd), n: int(v.n) });
+const modelMap = (o, max = 16) => {
+  const r = {};
+  if (!o || typeof o !== 'object') return r;
+  for (const [k, v] of Object.entries(o).slice(0, max)) if (MODEL_RE.test(k) && v && typeof v === 'object') r[k] = modelTok(v);
+  return r;
+};
+/** 用户打开开关才会有的项目文件夹名：去控制字符、截 40 字 */
+const cleanName = (v) => (typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 40) : '');
 
 /**
  * claude-code 快照白名单。**显式构造**（不是过滤）——
@@ -118,6 +137,12 @@ function sanitizeClaudeCode(s) {
         out: int(d.out),
         in: int(d.in),
         cacheCreate: int(d.cacheCreate),
+        // v2（插件 0.5.0 起）；老插件没有这些键 → 全 0 / 空表，服务端据 m 是否为空判断「这天能不能折算费用」
+        rd: int(d.rd), c1: int(d.c1), th: int(d.th), so: int(d.so), ws: int(d.ws), wf: int(d.wf),
+        la: int(d.la), lr: int(d.lr), am: int(d.am, 1440),
+        h: intMap(d.h, hourKey, 24),
+        m: modelMap(d.m),
+        t: intMap(d.t, (k) => TOOL_RE.test(k), 32),
       });
     }
   }
@@ -138,12 +163,33 @@ function sanitizeClaudeCode(s) {
     }
   }
 
+  let window = null;
+  const w = s.window;
+  if (w && typeof w === 'object' && int(w.e) > int(w.s)) {
+    window = { s: int(w.s), e: int(w.e), l: int(w.l), n: int(w.n), m: modelMap(w.m) };
+  }
+  const ss = s.sessStats && typeof s.sessStats === 'object' ? s.sessStats : {};
+  const sessStats = { n: int(ss.n), avgMin: int(ss.avgMin), maxMin: int(ss.maxMin) };
+  const projects = [];
+  if (Array.isArray(s.projects)) {
+    for (const p of s.projects.slice(0, 12)) {
+      if (!p || typeof p !== 'object' || typeof p.id !== 'string' || !PROJ_RE.test(p.id)) continue;
+      const row = { id: p.id, out: int(p.out), tok: int(p.tok), n: int(p.n), d7out: int(p.d7out), d7tok: int(p.d7tok) };
+      const name = cleanName(p.name);
+      if (name) row.name = name;
+      projects.push(row);
+    }
+  }
+
   const t = s.totals && typeof s.totals === 'object' ? s.totals : {};
   return {
-    v: 1,
+    v: s.v === 2 ? 2 : 1,
     days,
     byModel,
     hours,
+    window,
+    sessStats,
+    projects,
     totals: {
       sessions: int(t.sessions),
       msgs: int(t.msgs),
@@ -158,6 +204,60 @@ function sanitizeClaudeCode(s) {
 }
 
 const SOURCES = { 'claude-code': sanitizeClaudeCode };   // 枚举，不是自由字段
+
+// ─────────────────────────── API 标价 ───────────────────────────
+/*
+ * 每百万 token 美元：[输入, 5 分钟缓存写入, 1 小时缓存写入, 缓存读取, 输出]。
+ * 真源 = https://platform.claude.com/docs/en/about-claude/pricing （2026-09-24 抄录）。
+ * ⚠️ 这是「按 API 标价折算」—— 订阅（Pro / Max）用户并不按这个付钱，文案必须说成「值多少」而不是「花了多少」。
+ * 表外的模型不猜价：那部分 token 记为「未计价」，由页面如实标出。
+ * 快速模式（@fast）：Opus 5.5 / 5 / 4.8 的输入输出单价翻倍，缓存倍率叠在其上 → 整行 ×2。
+ */
+const PRICES = {
+  'claude-fable-5-1': [10, 12.5, 20, 0.25, 50],
+  'claude-mythos-5-1': [10, 12.5, 20, 0.25, 50],
+  'claude-fable-5': [10, 12.5, 20, 1, 50],
+  'claude-mythos-5': [10, 12.5, 20, 1, 50],
+  'claude-opus-5-5': [4, 5, 8, 0.2, 20],
+  'claude-opus-5': [5, 6.25, 10, 0.5, 25],
+  'claude-opus-4-8': [5, 6.25, 10, 0.5, 25],
+  'claude-opus-4-7': [5, 6.25, 10, 0.5, 25],
+  'claude-opus-4-6': [5, 6.25, 10, 0.5, 25],
+  'claude-opus-4-5': [5, 6.25, 10, 0.5, 25],
+  'claude-opus-4-1': [15, 18.75, 30, 1.5, 75],
+  'claude-opus-4': [15, 18.75, 30, 1.5, 75],
+  'claude-sonnet-5': [2, 2.5, 4, 0.2, 10],
+  'claude-sonnet-4-6': [3, 3.75, 6, 0.3, 15],
+  'claude-sonnet-4-5': [3, 3.75, 6, 0.3, 15],
+  'claude-sonnet-4': [3, 3.75, 6, 0.3, 15],
+  'claude-haiku-4-5': [1, 1.25, 2, 0.1, 5],
+  'claude-3-5-haiku': [0.8, 1, 1.6, 0.08, 4],
+};
+const WEB_SEARCH_USD = 0.01;                       // $10 / 1000 次；网页抓取不另收费
+const baseModel = (name) => String(name).replace(/@fast$/, '');
+/** 一个模型一份 token 明细的美元折算；表外模型返回 null */
+function priceOf(name, v) {
+  const key = baseModel(name).replace(/-\d{8}$/, '');   // 去掉发布日期后缀
+  const p = PRICES[key];
+  if (!p) return null;
+  const k = /@fast$/.test(name) ? 2 : 1;
+  return k * (v.in * p[0] + v.c5 * p[1] + v.c1 * p[2] + v.rd * p[3] + v.out * p[4]) / 1e6;
+}
+/** 一组按模型明细的总价：{ usd, unpriced: 表外模型的输出 token 数 } */
+function costOfModels(m) {
+  let usd = 0, unpriced = 0;
+  for (const [name, v] of Object.entries(m || {})) {
+    const c = priceOf(name, v);
+    if (c === null) unpriced += v.out + v.in; else usd += c;
+  }
+  return { usd, unpriced };
+}
+const r2 = (x) => Math.round(x * 100) / 100;
+/** 美元显示串。组件的取数流（VParser）没有取整 / 保留两位小数的方法，格式化只能在这儿做 ——
+ *  与页面 usd() 同一套规则：不到一分钱写 <$0.01（别把「几乎没花」写成 $0.00），过百取整加千分位。 */
+const usdS = (v) => (v == null || !isFinite(v) ? '--' : v === 0 ? '$0' : v < 0.01 ? '<$0.01'
+  : '$' + (v < 100 ? v.toFixed(2) : Math.round(v).toLocaleString('en-US')));
+const pct = (a, b) => (b > 0 ? Math.round((a / b) * 1000) / 10 : 0);
 
 /**
  * 多设备合并成一份（同一个人的多台机器应该看成一份用量）。
@@ -176,8 +276,20 @@ function mergeClaudeCode(list, anchor) {
       cur.msgs += d.msgs; cur.sessions += d.sessions; cur.out += d.out;
       cur.in += d.in; cur.cacheCreate += d.cacheCreate;
       dayMap.set(d.date, cur);
+      // v2 明细：放在不下发的 x 里，派生完再丢（days 列表下发给老包，不能长胖）
+      const x = cur.x || (cur.x = { rd: 0, c1: 0, th: 0, so: 0, ws: 0, wf: 0, la: 0, lr: 0, am: 0, h: {}, m: {}, t: {}, v1: false });
+      for (const k of ['rd', 'c1', 'th', 'so', 'ws', 'wf', 'la', 'lr', 'am']) x[k] += d[k] || 0;
+      for (const [k, v] of Object.entries(d.h || {})) x.h[k] = (x.h[k] || 0) + v;
+      for (const [k, v] of Object.entries(d.t || {})) x.t[k] = (x.t[k] || 0) + v;
+      for (const [k, v] of Object.entries(d.m || {})) {
+        const b = x.m[k] || (x.m[k] = { in: 0, out: 0, c5: 0, c1: 0, rd: 0, n: 0 });
+        for (const f of ['in', 'out', 'c5', 'c1', 'rd', 'n']) b[f] += v[f] || 0;
+      }
+      // 这台设备这天有用量却没有按模型明细 = 老插件推的，折算不了费用
+      if (d.out > 0 && !(d.m && Object.keys(d.m).length)) x.v1 = true;
     }
-    for (const [m, v] of Object.entries(s.byModel || {})) {
+    for (const [m0, v] of Object.entries(s.byModel || {})) {
+      const m = baseModel(m0);                    // 快速模式并回同一个模型：分布看的是「谁在干活」
       const b = byModel[m] || (byModel[m] = { in: 0, out: 0, msgs: 0 });
       b.in += v.in; b.out += v.out; b.msgs += v.msgs;
     }
@@ -189,7 +301,13 @@ function mergeClaudeCode(list, anchor) {
     tot.streak = Math.max(tot.streak, t.streak || 0);
     tot.longestStreak = Math.max(tot.longestStreak, t.longestStreak || 0);
   }
-  const days = [...dayMap.values()].sort((a, b) => (a.date < b.date ? -1 : 1));
+  const full = [...dayMap.values()].sort((a, b) => (a.date < b.date ? -1 : 1));
+  // 逐日下发只带四个小字段（详情页「这一天」要用）：费用（老插件推的日子折算不了 → null）/ 活跃分钟 / 改动行数
+  const days = full.map(({ x, ...d }) => ({
+    ...d,
+    usd: x && !x.v1 ? r2(costOfModels(x.m).usd + x.ws * WEB_SEARCH_USD) : null,
+    am: x ? x.am : 0, la: x ? x.la : 0, lr: x ? x.lr : 0,
+  }));
   tot.activeDays = days.length;
   // 模型按 output 降序，取前 6（卡上画不下更多，且服务端排好省得 RCN 里排）
   const totOut = Object.values(byModel).reduce((a, v) => a + v.out, 0) || 1;
@@ -212,9 +330,9 @@ function mergeClaudeCode(list, anchor) {
   const lastDate = days.length ? days[days.length - 1].date : '';
   // 看的人比采集机的时区靠后时，数据里会有「他的明天」—— 那就以数据为准，不往回退
   const anchorDate = anchor && (!lastDate || anchor >= lastDate) ? anchor : lastDate;
-  const zeroDay = (date) => ({ date, msgs: 0, sessions: 0, out: 0, in: 0, cacheCreate: 0 });
+  const zeroDay = (date) => ({ date, msgs: 0, sessions: 0, out: 0, in: 0, cacheCreate: 0, usd: 0, am: 0, la: 0, lr: 0 });
   const today = anchor
-    ? (dayMap.get(anchorDate) || zeroDay(anchorDate))
+    ? (days.find((d) => d.date === anchorDate) || zeroDay(anchorDate))
     : (days.length ? days[days.length - 1] : null);
 
   if (anchor) {
@@ -276,7 +394,145 @@ function mergeClaudeCode(list, anchor) {
     peakHour: peak ? Number(peak[0]) : -1,
     modelTop: models.length ? models[0].name : '',
     outMax: days.reduce((m, d) => Math.max(m, d.out), 0),
+    ...insights(full, list, anchorDate),
   };
+}
+
+/*
+ * 派生视图（2026-09-24）：周期对比 / 月度 / 费用 / 打卡图 / 工具 / token 构成 / 5 小时窗口 / 会话 / 项目。
+ * 全部以 anchorDate（看的人那天；老包 = 数据最后一天）为「今天」。日期都是采集机本地日期串，
+ * 只做字符串比较与 UTC 纯日期运算，绝不按服务器时区换算。
+ */
+function insights(full, list, anchorDate) {
+  const DAY = 864e5;
+  const ms = (d) => Date.parse(d + 'T00:00:00Z');
+  const iso = (t) => new Date(t).toISOString().slice(0, 10);
+  const back = (n) => iso(ms(anchorDate) - n * DAY);
+  const x0 = { rd: 0, c1: 0, th: 0, so: 0, ws: 0, wf: 0, la: 0, lr: 0, am: 0, h: {}, m: {}, t: {}, v1: false };
+  const X = (d) => d.x || x0;
+
+  /** 一段日期 [from, to]（含两端）的汇总 */
+  const agg = (from, to) => {
+    const a = { out: 0, msgs: 0, sessions: 0, days: 0, am: 0, la: 0, lr: 0, ws: 0, usd: 0, unpriced: 0, partial: false };
+    if (!anchorDate) return a;
+    for (const d of full) {
+      if (d.date < from || d.date > to) continue;
+      const x = X(d);
+      a.out += d.out; a.msgs += d.msgs; a.sessions += d.sessions; a.days += d.out > 0 || d.msgs > 0 ? 1 : 0;
+      a.am += x.am; a.la += x.la; a.lr += x.lr; a.ws += x.ws;
+      const c = costOfModels(x.m);
+      a.usd += c.usd + x.ws * WEB_SEARCH_USD; a.unpriced += c.unpriced;
+      if (x.v1) a.partial = true;                 // 老插件推的日子：有用量、没有按模型明细，折算不了
+    }
+    a.usd = r2(a.usd);
+    a.usdS = usdS(a.usd);
+    return a;
+  };
+  const periods = anchorDate ? {
+    today: agg(anchorDate, anchorDate),
+    d7: agg(back(6), anchorDate), d7p: agg(back(13), back(7)),
+    d30: agg(back(29), anchorDate), d30p: agg(back(59), back(30)),
+  } : null;
+
+  // 自然月：本月（至今）/ 上月（整月）
+  let months = null;
+  if (anchorDate) {
+    const [y, mo] = anchorDate.split('-').map(Number);
+    const first = `${anchorDate.slice(0, 7)}-01`;
+    const pm = mo === 1 ? `${y - 1}-12` : `${y}-${String(mo - 1).padStart(2, '0')}`;
+    const pmLast = iso(ms(first) - DAY);
+    months = { cur: { ym: anchorDate.slice(0, 7), ...agg(first, anchorDate) }, prev: { ym: pm, ...agg(`${pm}-01`, pmLast) } };
+  }
+
+  // 最高的一天（按输出 token）
+  let best = null;
+  for (const d of full) if (!best || d.out > best.out) best = d;
+  best = best && best.out > 0 ? { date: best.date, out: best.out, usd: r2(costOfModels(X(best).m).usd) } : null;
+
+  // 近 30 天：费用按模型 / 工具 / token 构成 / 活跃
+  const from30 = anchorDate ? back(29) : '';
+  const m30 = {}, t30 = {};
+  const comp = { out: 0, in: 0, c5: 0, c1: 0, rd: 0, th: 0, so: 0 };
+  for (const d of full) {
+    if (!anchorDate || d.date < from30 || d.date > anchorDate) continue;
+    const x = X(d);
+    for (const [k, v] of Object.entries(x.m)) {
+      const b = m30[k] || (m30[k] = { in: 0, out: 0, c5: 0, c1: 0, rd: 0, n: 0 });
+      for (const f of ['in', 'out', 'c5', 'c1', 'rd', 'n']) b[f] += v[f];
+    }
+    for (const [k, v] of Object.entries(x.t)) t30[k] = (t30[k] || 0) + v;
+    comp.out += d.out; comp.in += d.in; comp.c1 += x.c1; comp.c5 += Math.max(0, d.cacheCreate - x.c1);
+    comp.rd += x.rd; comp.th += x.th; comp.so += x.so;
+  }
+  const byBase = {};
+  for (const [k, v] of Object.entries(m30)) {
+    const c = priceOf(k, v);
+    const b = byBase[baseModel(k)] || (byBase[baseModel(k)] = { name: baseModel(k), usd: 0, unpriced: false, fast: 0 });
+    if (c === null) b.unpriced = true; else b.usd += c;
+    if (/@fast$/.test(k)) b.fast += v.out;
+  }
+  const costSum = Object.values(byBase).reduce((a, b) => a + b.usd, 0);
+  const costModels = Object.values(byBase).sort((a, b) => b.usd - a.usd).slice(0, 6)
+    .map((b) => ({ name: b.name, usd: r2(b.usd), pct: pct(b.usd, costSum), unpriced: b.unpriced, fastOut: b.fast }));
+  const toolSum = Object.values(t30).reduce((a, b) => a + b, 0);
+  const tools = Object.entries(t30).sort((a, b) => b[1] - a[1]).slice(0, 12)
+    .map(([name, n]) => ({ name, n, pct: pct(n, toolSum) }));
+  const inputSide = comp.in + comp.c5 + comp.c1 + comp.rd;
+  const composition = {
+    ...comp,
+    hitRate: pct(comp.rd, inputSide),           // 送进模型的上下文里有多少是缓存命中
+    thinkPct: pct(comp.th, comp.out),
+    sidePct: pct(comp.so, comp.out),
+  };
+
+  // 星期 × 小时（真人发言）：index = 星期(0=周日) × 24 + 小时；近 90 天
+  const punch = new Array(168).fill(0);
+  for (const d of full) {
+    const wd = new Date(ms(d.date)).getUTCDay();
+    for (const [h, c] of Object.entries(X(d).h)) punch[wd * 24 + Number(h)] += c;
+  }
+  const punchMax = Math.max(0, ...punch);
+
+  // 5 小时窗口：各设备「还没结束」的窗口里，最早开始的那个就是账号的窗口，用量相加
+  const now = Date.now();
+  const live = list.map((s) => s.window).filter((w) => w && w.e > now);
+  let window = null;
+  if (live.length) {
+    const first = live.reduce((a, b) => (b.s < a.s ? b : a));
+    const m = {};
+    let n = 0, last = 0;
+    for (const w of live) {
+      n += w.n; last = Math.max(last, w.l);
+      for (const [k, v] of Object.entries(w.m)) {
+        const b = m[k] || (m[k] = { in: 0, out: 0, c5: 0, c1: 0, rd: 0, n: 0 });
+        for (const f of ['in', 'out', 'c5', 'c1', 'rd', 'n']) b[f] += v[f];
+      }
+    }
+    const c = costOfModels(m);
+    const out = Object.values(m).reduce((a, v) => a + v.out, 0);
+    const elapsed = Math.max(0, Math.min(now, first.e) - first.s);
+    // 按目前的速度到窗口结束：开窗不到 20 分钟不外推（样本太少，会报出吓人的数）
+    const proj = elapsed >= 20 * 60e3 ? r2(c.usd * (first.e - first.s) / elapsed) : null;
+    window = { start: first.s, end: first.e, last, n, out, usd: r2(c.usd), unpriced: c.unpriced, projUsd: proj,
+      usdS: usdS(r2(c.usd)), projS: proj == null ? '' : usdS(proj) };
+  }
+
+  // 会话活跃时长：各设备加权平均 / 取最长
+  let sn = 0, ssum = 0, smax = 0;
+  for (const s of list) {
+    const ss = s.sessStats;
+    if (!ss || !ss.n) continue;
+    sn += ss.n; ssum += ss.avgMin * ss.n; smax = Math.max(smax, ss.maxMin);
+  }
+  const sessions = { n: sn, avgMin: sn ? Math.round(ssum / sn) : 0, maxMin: smax };
+
+  // 项目：各设备的项目编号互不相通（盐按设备），直接拼起来按用量排
+  const projects = list.flatMap((s) => s.projects || []).sort((a, b) => b.tok - a.tok).slice(0, 10)
+    .map((p) => ({ id: p.id, name: p.name || null, out: p.out, tok: p.tok, n: p.n, d7out: p.d7out }));
+  const projTok = projects.reduce((a, p) => a + p.tok, 0);
+  for (const p of projects) p.pct = pct(p.tok, projTok);
+
+  return { periods, months, best, costModels, tools, composition, punch, punchMax, window, sessions, projects };
 }
 
 // ─────────────────────────── 路由 ───────────────────────────
@@ -406,7 +662,9 @@ async function handle(req, env, ctx) {
     // ?today= 只在离服务器时间 3 天以内才认 —— 各时区的「今天」都落在这个窗里，再远就是参数写错了
     const q = url.searchParams.get('today') || '';
     const anchor = DATE_RE.test(q) && Math.abs(Date.parse(q + 'T12:00:00Z') - Date.now()) < 3 * 864e5 ? q : '';
-    return json({ updatedAt, merged: mergeClaudeCode(sources['claude-code'] || [], anchor), sources });
+    const merged = mergeClaudeCode(sources['claude-code'] || [], anchor);
+    // ?lite=1：只要合并视图（组件 / 页面用）；各设备原样快照只有 --devices 这类工具才要
+    return json(url.searchParams.get('lite') === '1' ? { updatedAt, merged } : { updatedAt, merged, sources });
   }
 
   return err('not_found', 404);

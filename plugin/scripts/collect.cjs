@@ -7,17 +7,23 @@
  *
  * 隐私硬承诺（可审计 —— 见 buildPayload 的显式白名单构造）：
  *   读取的字段只有 type / timestamp / sessionId / isSidechain / isMeta / origin.kind /
- *   message.id / requestId / message.model / message.usage.*；
- *   另外 user 行的 message.content 只看两样东西来判断「这是不是你本人发的」（见 isHumanPrompt）：
- *   数组里各项的 type（有没有 tool_result）、正文开头是不是系统注入的固定标签。判断完即丢弃。
- *   cwd、gitBranch、对话正文、toolUseResult 一律不落盘、不上报。
- *   上报体里唯一的字符串是「模型名」与「日期」。主机名只以 hash 形式出现。
+ *   message.id / requestId / message.model / message.usage.* / cwd，外加三处只取结构不取内容：
+ *   - user 行的 message.content：数组各项的 type（有没有 tool_result）、正文开头是不是系统注入的固定标签
+ *     —— 判断「这是不是你本人发的」（见 isHumanPrompt）；
+ *   - assistant 行 tool_use 块的 name：映射进固定词表（MCP 一律并成 MCP），数调用次数；
+ *   - toolUseResult 的补丁：只数行首 + / -（新建文件数行数），算代码改动行数。
+ *   都是判断完 / 数完即丢，正文不落盘、不上报。
+ *   cwd 只在本机用来区分项目：上报的是「本机随机盐 + 项目根目录」的哈希，服务端反推不出路径；
+ *   用户显式 --projects on 后才附上项目文件夹名（只取最后一段）。gitBranch 不读。
+ *   上报体里的字符串只有：模型名、日期、固定词表里的工具名、（打开开关时的）项目文件夹名。主机名只以 hash 形式出现。
  *
  * 计数口径（2026-09-24 修正，history v2）：
  *   - token：按 API 响应计。Claude Code 把一次回复的每个内容块各写一行，且每行带着同一份
  *     usage —— 必须按 message.id + requestId 去重，否则 token 虚高 2~3 倍。
  *   - 消息：真人发言 + Claude 回复（同样按响应去重），不含工具返回结果与系统注入。
  *   - 活跃时段：只看真人发言。工具返回结果的 type 也是 user，占 user 行九成。
+ * 数据扩充（同日，history v3 / 快照 v2）：缓存读取与 1 小时写入、思考 token、子代理输出、联网次数、
+ *   工具调用次数、改动行数、活跃分钟、会话活跃时长、5 小时窗口、按项目 —— 全是数字；费用由服务端按价目折算。
  *
  * 失败姿态：任何异常都必须静默吞掉 —— 这是挂在 SessionEnd 上的 hook，
  * 打断用户的 Claude Code 会话是最不可接受的失败。
@@ -94,9 +100,12 @@ function tryLock(lockPath) {
     // 持锁进程已经不在了（被杀 / 崩溃）或锁太旧 → 清掉再试一次
     let stale;
     try {
-      const pid = parseInt(fs.readFileSync(lockPath, 'utf8'), 10);
+      const raw = fs.readFileSync(lockPath, 'utf8');
+      const pid = parseInt(raw, 10);
       const age = Date.now() - fs.statSync(lockPath).mtimeMs;
-      stale = !pidAlive(pid) || age > LOCK_STALE_MS;
+      // ⚠️ 对方是先 open('wx') 建出空文件、再写进程号 —— 读到空内容 = 对方正在写，不是死了。
+      // 按「pid 不在」判过期会在这个缝里抢走一把活锁（两个进程同时持锁，首次接入建出两个空间）。
+      stale = Number.isInteger(pid) && pid > 0 ? !pidAlive(pid) || age > LOCK_STALE_MS : age > 10000;
     } catch { stale = true; }                // 读不到 = 对方刚释放
     if (!stale) return false;
     try { fs.unlinkSync(lockPath); } catch { /* 别人先清了 */ }
@@ -115,15 +124,72 @@ async function acquireLock(lockPath = LOCK, waitMs = LOCK_WAIT_MS) {
 
 // ---------- 空历史 ----------
 // v2 = 2026-09-24 口径修正（token 按响应去重 / 消息不含工具结果）。
-// v1 的数字虚高，不与 v2 混用：读到 v1 直接丢弃，从本机会话记录全量重算。
-const HISTORY_V = 2;
-const emptyDay = () => ({ msgs: 0, sess: [], out: 0, in: 0, cr: 0, rd: 0, hours: {}, byModel: {} });
+// v3 = 同日数据扩充（缓存读取 / 思考 / 工具 / 改动行数 / 活跃分钟 / 项目 / 5 小时窗口）——
+//      新字段只能从会话记录重扫得到，旧版本历史一律丢弃重算。
+const HISTORY_V = 3;
+const emptyDay = () => ({
+  msgs: 0, sess: [], out: 0, in: 0, cr: 0, c1: 0, rd: 0, th: 0, so: 0, ws: 0, wf: 0, la: 0, lr: 0,
+  hours: {}, byModel: {}, tools: {}, proj: {}, act: '',
+});
 
 function loadHistory(p = HISTORY) {
   const h = readJson(p, null);
-  if (!h || h.v !== HISTORY_V || !h.days || typeof h.days !== 'object') return { v: HISTORY_V, files: {}, days: {} };
-  if (!h.files || typeof h.files !== 'object') h.files = {};
+  const fresh = () => ({
+    v: HISTORY_V, files: {}, days: {},
+    sessions: {},                                    // sessionId → [首条时刻, 末条时刻, 活跃毫秒]
+    events: [],                                      // 近 12 小时的回复 [时刻, 模型, in, out, c5, c1, rd]，算 5 小时窗口
+    salt: crypto.randomBytes(8).toString('hex'),     // 项目键的盐：只在本机，服务端反推不出路径
+    projNames: {},                                   // 项目键 → 文件夹名：只在本机，开了开关才上传
+  });
+  if (!h || h.v !== HISTORY_V || !h.days || typeof h.days !== 'object') return fresh();
+  const f = fresh();
+  for (const k of ['files', 'sessions', 'projNames']) if (!h[k] || typeof h[k] !== 'object') h[k] = f[k];
+  if (!Array.isArray(h.events)) h.events = [];
+  if (typeof h.salt !== 'string' || !h.salt) h.salt = f.salt;
   return h;
+}
+
+// ---------- 活跃时长 ----------
+// 两次往来间隔不超过 5 分钟算连续（在读输出、在想下一句）；更长就是离开了。
+const GAP_MIN = 5;
+const GAP_MS = GAP_MIN * 60000;
+// 每天一张 1440 位的位图：这一分钟里有没有任何往来（你或 Claude）。
+// 跨会话取并集 —— 两个会话同时开着，那段时间不会算两遍。
+const ACT_BYTES = 180;
+const actCache = new Map();                          // day 对象 → Buffer；扫描结束 flushAct 写回 base64
+function markActive(day, ts) {
+  let b = actCache.get(day);
+  if (!b) {
+    b = day.act ? Buffer.from(day.act, 'base64') : Buffer.alloc(ACT_BYTES);
+    if (b.length !== ACT_BYTES) b = Buffer.alloc(ACT_BYTES);
+    actCache.set(day, b);
+  }
+  const d = new Date(ts);
+  const m = d.getHours() * 60 + d.getMinutes();
+  b[m >> 3] |= 1 << (m & 7);
+}
+function flushAct() {
+  for (const [day, b] of actCache) day.act = b.toString('base64');
+  actCache.clear();
+}
+/** 活跃分钟 = 有往来的分钟 + 两次往来之间不超过 5 分钟的空档 */
+function activeMinutes(act) {
+  if (!act) return 0;
+  const b = Buffer.from(act, 'base64');
+  let total = 0, last = -1;
+  for (let m = 0; m < 1440; m++) {
+    if (!(b[m >> 3] & (1 << (m & 7)))) continue;
+    total += last >= 0 && m - last <= GAP_MIN ? m - last : 1;
+    last = m;
+  }
+  return total;
+}
+/** 会话的活跃时长：同上的「5 分钟内算连续」，按会话累加（桌面端的会话能挂好几天，首末时刻相减没有意义） */
+function touchSession(sessions, sid, ts) {
+  const s = sessions[sid];
+  if (!s) { sessions[sid] = [ts, ts, 60000]; return; }
+  if (ts > s[1]) { const g = ts - s[1]; s[2] += g <= GAP_MS ? g : 60000; s[1] = ts; }
+  if (ts < s[0]) s[0] = ts;
 }
 
 // ---------- 增量扫描 ----------
@@ -186,8 +252,71 @@ const responseKey = (o) => {
 const RECENT_KEYS = 32;
 const remember = (recent, k) => { recent.push(k); if (recent.length > RECENT_KEYS) recent.shift(); };
 
-/** 把一行的数字并进 history。recent = 本文件最近的响应键（会被修改）。返回是否计入。 */
-function absorb(days, o, recent) {
+// 工具名：固定词表以外的一律 Other；MCP 工具统一并成 MCP —— 不暴露你装了哪些 MCP 服务。
+// 同一件事的几个内置工具归成一类（待办清单一类、派代理 / 代理间通信一类），排行里才读得出「在干什么」。
+const TOOL_GROUP = {
+  Task: 'Agent', SendMessage: 'Agent', ListAgents: 'Agent', TaskStop: 'Agent', TaskOutput: 'Agent',
+  TodoWrite: 'Todo', TaskCreate: 'Todo', TaskUpdate: 'Todo',
+  MultiEdit: 'Edit', LS: 'Glob', BashOutput: 'Bash', KillShell: 'Bash',
+};
+const TOOL_NAMES = new Set([
+  'Bash', 'Read', 'Edit', 'Write', 'Grep', 'Glob', 'WebSearch', 'WebFetch', 'Agent', 'Todo',
+  'NotebookEdit', 'Skill', 'ToolSearch', 'AskUserQuestion', 'ExitPlanMode', 'EnterPlanMode', 'SlashCommand',
+]);
+const normTool = (n) => {
+  if (typeof n !== 'string' || !n) return null;
+  if (n.startsWith('mcp__')) return 'MCP';
+  const g = TOOL_GROUP[n] || n;
+  return TOOL_NAMES.has(g) ? g : 'Other';
+};
+
+/** 代码改动行数：编辑结果的补丁只数行首 + / -，新建文件数内容行数。正文本身不留、不传。 */
+function countLines(day, r) {
+  if (!r || typeof r !== 'object') return;
+  if (Array.isArray(r.structuredPatch) && r.structuredPatch.length) {
+    for (const h of r.structuredPatch) {
+      for (const l of (h && Array.isArray(h.lines) ? h.lines : [])) {
+        if (typeof l !== 'string') continue;
+        if (l[0] === '+') day.la++;
+        else if (l[0] === '-') day.lr++;
+      }
+    }
+  } else if (r.type === 'create' && typeof r.content === 'string' && r.content) {
+    day.la += r.content.split('\n').length - (r.content.endsWith('\n') ? 1 : 0);
+  }
+}
+
+/**
+ * 项目键 = 本机随机盐 + 项目根目录的哈希。项目根 = 往上找到的第一个 git 仓库
+ * （worktree 先归回它所属的项目）；找不到就用工作目录本身。
+ */
+const projMemo = new Map();
+function projectOf(ext, cwd) {
+  if (!ext || typeof cwd !== 'string' || !cwd) return null;
+  let id = projMemo.get(cwd);
+  if (id) return id;
+  const stripped = cwd.replace(/[\\/]\.claude[\\/]worktrees[\\/][^\\/]+.*$/, '');
+  let root = stripped;
+  for (let d = stripped, i = 0; i < 12; i++) {
+    try { if (fs.existsSync(path.join(d, '.git'))) { root = d; break; } } catch { break; }
+    const up = path.dirname(d);
+    if (up === d) break;
+    d = up;
+  }
+  id = crypto.createHash('sha256').update(ext.salt + '|' + root).digest('hex').slice(0, 10);
+  if (!ext.projNames[id]) ext.projNames[id] = path.basename(root) || root;
+  projMemo.set(cwd, id);
+  return id;
+}
+
+const EVENT_KEEP_MS = 12 * 3600e3;                   // 5 小时窗口只看近 12 小时的回复
+
+/**
+ * 把一行的数字并进 history。
+ * st  = 本文件的去重状态 { recent: 响应键, rt: 工具调用 id }（会被修改）
+ * ext = history 本身（会话表 / 窗口事件 / 项目盐）；测试里可以不给
+ */
+function absorb(days, o, st, ext) {
   const t = o.type;
   if (t !== 'user' && t !== 'assistant') return false;
   const ts = o.timestamp ? Date.parse(o.timestamp) : NaN;
@@ -197,10 +326,17 @@ function absorb(days, o, recent) {
   const day = days[date] || (days[date] = emptyDay());
   const side = !!o.isSidechain;
 
-  // Sessions：排除 sidechain（subagent 内部往返不是「你的对话」）
-  if (!side && typeof o.sessionId === 'string' && !day.sess.includes(o.sessionId)) day.sess.push(o.sessionId);
+  // 会话 / 活跃时长：排除 sidechain（subagent 内部往返不是「你的对话」）
+  if (!side) {
+    if (typeof o.sessionId === 'string') {
+      if (!day.sess.includes(o.sessionId)) day.sess.push(o.sessionId);
+      if (ext) touchSession(ext.sessions, o.sessionId, ts);
+    }
+    markActive(day, ts);
+  }
 
   if (t === 'user') {
+    countLines(day, o.toolUseResult);                // 含子代理：它改的也是你的代码
     // Messages / Peak hour：只数你本人发的，排除 sidechain
     if (!side && isHumanPrompt(o)) {
       day.msgs++;
@@ -210,30 +346,59 @@ function absorb(days, o, recent) {
     return true;
   }
 
+  const m = o.message;
   // Claude Code 在 API 报错 / 中断时写一条 model=<synthetic> 的占位回复，usage 全 0 ——
   // 不是模型真的回了话，不计消息、不进模型分布
-  if (o.message && o.message.model === '<synthetic>') return true;
+  if (m && m.model === '<synthetic>') return true;
+
+  // 工具调用：每行只带一个内容块，同一响应的各行内容各不相同 ——
+  // 必须在「同一响应只计一次」之前逐行数；按调用 id 去重，防整行重复写入
+  if (m && Array.isArray(m.content)) {
+    for (const c of m.content) {
+      if (!c || c.type !== 'tool_use') continue;
+      const name = normTool(c.name);
+      if (!name) continue;
+      if (typeof c.id === 'string') {
+        if (st.rt.includes(c.id)) continue;
+        remember(st.rt, c.id);
+      }
+      day.tools[name] = (day.tools[name] || 0) + 1;
+    }
+  }
 
   // assistant：同一响应只计一次
   const k = responseKey(o);
   if (k) {
-    if (recent.includes(k)) return true;
-    remember(recent, k);
+    if (st.recent.includes(k)) return true;
+    remember(st.recent, k);
   }
   if (!side) day.msgs++;
 
   // Tokens：含 sidechain（subagent 也在真实消耗）
-  const m = o.message;
   if (m && typeof m === 'object' && m.usage && typeof m.usage === 'object') {
     const u = m.usage;
     const n = (x) => (typeof x === 'number' && Number.isFinite(x) ? x : 0);
     const oi = n(u.input_tokens), oo = n(u.output_tokens);
     const ocr = n(u.cache_creation_input_tokens), ord = n(u.cache_read_input_tokens);
-    day.in += oi; day.out += oo; day.cr += ocr; day.rd += ord;
-    const mm = normModel(m.model);
+    const oc1 = Math.min(ocr, n(u.cache_creation && u.cache_creation.ephemeral_1h_input_tokens));
+    const oc5 = ocr - oc1;
+    const stu = u.server_tool_use && typeof u.server_tool_use === 'object' ? u.server_tool_use : {};
+    day.in += oi; day.out += oo; day.cr += ocr; day.c1 += oc1; day.rd += ord;
+    day.th += n(u.output_tokens_details && u.output_tokens_details.thinking_tokens);
+    day.ws += n(stu.web_search_requests); day.wf += n(stu.web_fetch_requests);
+    if (side) day.so += oo;
+    // 快速模式单独记：同一个模型，单价翻倍
+    const base = normModel(m.model);
+    const mm = base && u.speed === 'fast' ? base + '@fast' : base;
     if (mm) {
-      const b = day.byModel[mm] || (day.byModel[mm] = { in: 0, out: 0, msgs: 0 });
-      b.in += oi; b.out += oo; b.msgs++;
+      const b = day.byModel[mm] || (day.byModel[mm] = { in: 0, out: 0, c5: 0, c1: 0, rd: 0, msgs: 0 });
+      b.in += oi; b.out += oo; b.c5 = (b.c5 || 0) + oc5; b.c1 = (b.c1 || 0) + oc1; b.rd = (b.rd || 0) + ord; b.msgs++;
+      if (ext && ts > Date.now() - EVENT_KEEP_MS) ext.events.push([ts, mm, oi, oo, oc5, oc1, ord]);
+    }
+    const pid = projectOf(ext, o.cwd);
+    if (pid) {
+      const p = day.proj[pid] || (day.proj[pid] = { out: 0, tok: 0, n: 0 });
+      p.out += oo; p.tok += oi + oo + ocr + ord; p.n++;
     }
   }
   return true;
@@ -269,15 +434,16 @@ async function scan(history, root = PROJECTS) {
   let touched = 0;
 
   for (const f of files) {
-    let st; try { st = fs.statSync(f); } catch { continue; }
+    let fst; try { fst = fs.statSync(f); } catch { continue; }
     const prev = history.files[f];
     let from = 0;
-    let recent = [];
+    const st = { recent: [], rt: [] };
     if (prev && typeof prev.off === 'number' && typeof prev.size === 'number') {
-      if (st.size === prev.size) continue;                // 没变，跳过
-      if (st.size > prev.size) {                          // append，从上次最后一个完整行之后续读
+      if (fst.size === prev.size) continue;                // 没变，跳过
+      if (fst.size > prev.size) {                          // append，从上次最后一个完整行之后续读
         from = prev.off;
-        if (Array.isArray(prev.recent)) recent = prev.recent.slice(-RECENT_KEYS);
+        if (Array.isArray(prev.recent)) st.recent = prev.recent.slice(-RECENT_KEYS);
+        if (Array.isArray(prev.rt)) st.rt = prev.rt.slice(-RECENT_KEYS);
       } else log('rewound, rescan:', path.basename(f));    // 被重写，从头读
     }
 
@@ -285,7 +451,7 @@ async function scan(history, root = PROJECTS) {
     // 边界必须在读之前定死 —— 读的过程中文件还在被别的会话追加，
     // 不设 end 就会读进 stat 之后的行，而 offset 又停在它们之前 → 下一轮重复计入。
     let off;
-    try { off = lastLineEnd(f, from, st.size); } catch { continue; }
+    try { off = lastLineEnd(f, from, fst.size); } catch { continue; }
 
     if (off > from) {
       await new Promise((resolve) => {
@@ -293,18 +459,22 @@ async function scan(history, root = PROJECTS) {
         const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
         rl.on('line', (line) => {
           if (!line) return;
-          try { absorb(history.days, JSON.parse(line), recent); } catch { /* 坏行，丢弃 */ }
+          try { absorb(history.days, JSON.parse(line), st, history); } catch { /* 坏行，丢弃 */ }
         });
         rl.on('close', resolve);
         rs.on('error', () => resolve());
       });
     }
 
-    const entry = { off, size: st.size };
-    if (recent.length && Date.now() - st.mtimeMs < RECENT_TTL_MS) entry.recent = recent;
+    const entry = { off, size: fst.size };
+    if (Date.now() - fst.mtimeMs < RECENT_TTL_MS) {
+      if (st.recent.length) entry.recent = st.recent;
+      if (st.rt.length) entry.rt = st.rt;
+    }
     history.files[f] = entry;
     touched++;
   }
+  flushAct();
   return touched;
 }
 
@@ -312,6 +482,10 @@ async function scan(history, root = PROJECTS) {
 function prune(history) {
   const cutoff = localDay(new Date(Date.now() - KEEP_DAYS * 864e5));
   for (const d of Object.keys(history.days)) if (d < cutoff) delete history.days[d];
+  const old = Date.now() - KEEP_DAYS * 864e5;
+  for (const [sid, v] of Object.entries(history.sessions || {})) if (!Array.isArray(v) || v[1] < old) delete history.sessions[sid];
+  const recentCut = Date.now() - EVENT_KEEP_MS;
+  history.events = (history.events || []).filter((e) => Array.isArray(e) && e[0] >= recentCut);
   // 文件表：projects 里已消失的文件清掉，防无限增长
   for (const f of Object.keys(history.files)) if (!fs.existsSync(f)) delete history.files[f];
 }
@@ -343,7 +517,7 @@ function ghostOf(localDays, remoteDays) {
 
 // ---------- 显式白名单构造 payload ----------
 /** 只有这里列出的字段会离开本机。新增字段必须显式加在这里。 */
-function buildPayload(history, device) {
+function buildPayload(history, device, opts = {}) {
   const days = [];
   const byModel = {};
   const hours = {};
@@ -353,6 +527,10 @@ function buildPayload(history, device) {
   for (const date of Object.keys(history.days).sort()) {
     const d = history.days[date];
     const sessions = Array.isArray(d.sess) ? d.sess.length : 0;
+    const m = {};
+    for (const [name, v] of Object.entries(d.byModel || {})) {
+      m[name] = { in: v.in | 0, out: v.out | 0, c5: v.c5 | 0, c1: v.c1 | 0, rd: v.rd | 0, n: v.msgs | 0 };
+    }
     days.push({
       date,                                   // 采集机本地日期字符串，全链路原样透传，不做时区转换
       msgs: d.msgs | 0,
@@ -360,6 +538,17 @@ function buildPayload(history, device) {
       out: d.out | 0,
       in: d.in | 0,
       cacheCreate: d.cr | 0,
+      // v2 起（插件 0.5.0）
+      rd: d.rd || 0,                          // 缓存读取（量级常是输出的数百倍，不进「总量」，只算费用与命中率）
+      c1: d.c1 | 0,                           // 缓存写入里 1 小时那档（单价是 5 分钟档的 1.6 倍）
+      th: d.th | 0,                           // 思考 token（含在 out 里）
+      so: d.so | 0,                           // 子代理产生的输出（含在 out 里）
+      ws: d.ws | 0, wf: d.wf | 0,             // 联网搜索 / 抓取次数（搜索按次计费）
+      la: d.la | 0, lr: d.lr | 0,             // 代码增 / 删行数
+      am: activeMinutes(d.act),               // 活跃分钟
+      h: d.hours || {},                       // 真人发言的小时分布（按天给，服务端据此出星期 × 小时）
+      m,                                      // 按模型的 token 明细（服务端据此按价目折算费用）
+      t: d.tools || {},                       // 工具调用次数
     });
     if (Array.isArray(d.sess)) for (const id of d.sess) allSess.add(id);
     tMsgs += d.msgs | 0; tOut += d.out | 0; tIn += d.in | 0; tCr += d.cr | 0;
@@ -392,14 +581,66 @@ function buildPayload(history, device) {
     prev = d.date;
   }
 
+  // 5 小时窗口：与社区 ccusage 同法 —— 窗口从一次往来所在的整点起算、持续 5 小时，
+  // 窗口结束后的第一次往来开下一个窗口。只能算「用了多少」，官方的剩余额度拿不到。
+  let window = null;
+  {
+    const ev = (history.events || []).filter(Array.isArray).sort((a, b) => a[0] - b[0]);
+    let cur = null;
+    for (const [ts, name, i, o, c5, c1, rd] of ev) {
+      if (!cur || ts >= cur.e) {
+        const s0 = Math.floor(ts / 3600e3) * 3600e3;
+        cur = { s: s0, e: s0 + 5 * 3600e3, l: ts, n: 0, m: {} };
+      }
+      const b = cur.m[name] || (cur.m[name] = { in: 0, out: 0, c5: 0, c1: 0, rd: 0, n: 0 });
+      b.in += i; b.out += o; b.c5 += c5; b.c1 += c1; b.rd += rd; b.n++;
+      cur.n++; cur.l = ts;
+    }
+    if (cur && cur.e > Date.now()) window = cur;
+  }
+
+  // 会话的活跃时长（近 30 天有动静的会话）
+  const sessStats = { n: 0, avgMin: 0, maxMin: 0 };
+  {
+    const cut = Date.now() - 30 * 864e5;
+    let sum = 0;
+    for (const v of Object.values(history.sessions || {})) {
+      if (!Array.isArray(v) || v[1] < cut) continue;
+      const min = Math.round(v[2] / 60000);
+      sessStats.n++; sum += min; sessStats.maxMin = Math.max(sessStats.maxMin, min);
+    }
+    sessStats.avgMin = sessStats.n ? Math.round(sum / sessStats.n) : 0;
+  }
+
+  // 按项目：只有匿名编号；本机打开开关（--projects on）才带文件夹名
+  const projects = [];
+  {
+    const agg = {};
+    const d7 = dayStr(6);
+    for (const [date, d] of Object.entries(history.days)) {
+      for (const [id, v] of Object.entries(d.proj || {})) {
+        const a = agg[id] || (agg[id] = { id, out: 0, tok: 0, n: 0, d7out: 0, d7tok: 0 });
+        a.out += v.out | 0; a.tok += v.tok || 0; a.n += v.n | 0;
+        if (date >= d7) { a.d7out += v.out | 0; a.d7tok += v.tok || 0; }
+      }
+    }
+    for (const a of Object.values(agg).sort((x, y) => y.tok - x.tok).slice(0, 12)) {
+      if (opts.projectNames && history.projNames && history.projNames[a.id]) a.name = String(history.projNames[a.id]).slice(0, 40);
+      projects.push(a);
+    }
+  }
+
   return {
     source: 'claude-code',
     device,
     snapshot: {
-      v: 1,
+      v: 2,
       days,
       byModel,
       hours,
+      window,
+      sessStats,
+      projects,
       totals: { sessions: allSess.size, msgs: tMsgs, out: tOut, in: tIn, cacheCreate: tCr,
                 activeDays: days.length, streak, longestStreak: longest },
     },
@@ -447,6 +688,7 @@ async function cmdStatus() {
   console.log('\n把用量接到 Numable：--token 打印读取令牌（粘进 App 的凭证设置）。');
   console.log('还有别的电脑也在用 Claude Code？--link 生成加入串，让它们合并到同一个空间。');
   console.log('数字比实际偏大？--devices 看看有没有这台电脑改名前留下的旧记录。');
+  console.log(`按项目：${cfg.projectNames === true ? '上传文件夹名' : '只传匿名编号'}（--projects on|off）`);
 }
 
 /**
@@ -524,6 +766,31 @@ async function cmdForget(id) {
     : `服务端没有设备 ${id}（可能已经删过了）。`);
 }
 
+/** 「按项目」要不要带上项目文件夹名。默认关：只传匿名编号（本机加盐哈希）。 */
+async function cmdProjects(v) {
+  const cfg = readJson(CONFIG, null);
+  if (!cfg || !cfg.spaceId) { console.log('尚未接入，先跑一次采集（或在 Claude Code 里开一个新会话）。'); return; }
+  if (v !== 'on' && v !== 'off') {
+    console.log(cfg.projectNames === true
+      ? '现在：上传项目文件夹名（只取最后一段，不含完整路径）。关掉：--projects off'
+      : '现在：只上传匿名编号（组件里显示成「项目 A / B / C」）。要显示文件夹名：--projects on');
+    return;
+  }
+  const release = await acquireLock();
+  if (!release) { console.log('采集正在进行，过几秒再试一次。'); return; }
+  try {
+    const cur = readJson(CONFIG, cfg);
+    cur.projectNames = v === 'on';
+    writeJson(CONFIG, cur);
+    await collectAndPush({ force: true });           // 立刻推一次，让服务端那份跟着变（关掉时名字随即消失）
+  } finally {
+    release();
+  }
+  console.log(v === 'on'
+    ? '已打开：会上传项目文件夹名（只取最后一段，不含完整路径）。随时可以 --projects off 关掉。'
+    : '已关闭：只上传匿名编号，服务端那份里的文件夹名已被这次推送覆盖掉。');
+}
+
 /** 另一台电脑加入本空间用的一串：空间 id + 两枚令牌（+ 非默认服务端）。 */
 function cmdLink() {
   const cfg = readJson(CONFIG, null);
@@ -585,6 +852,7 @@ async function main() {
   if (arg === '--token') return cmdToken();
   if (arg === '--devices') return cmdDevices();
   if (arg === '--forget') return cmdForget(process.argv[3]);
+  if (arg === '--projects') return cmdProjects(process.argv[3]);
   if (arg === '--link') return cmdLink();
   if (arg === '--join') return cmdJoin(process.argv[3]);
   if (arg === '--run' || DEBUG) return runCollect();
@@ -657,7 +925,7 @@ async function collectAndPush({ force = false } = {}) {
   }
   const device = cfg.device;
 
-  const payload = buildPayload(history, device);
+  const payload = buildPayload(history, device, { projectNames: cfg.projectNames === true });
   const r = await post('/ingest', payload, cfg.writeToken);
   if (!r.ok) { log('ingest failed', r.status, r.text); return; }
   log('pushed', payload.snapshot.days.length, 'days');
@@ -680,4 +948,4 @@ if (require.main === module) {
 }
 
 // 供测试用（hook 直接执行本文件，走上面那条）
-module.exports = { absorb, isHumanPrompt, scan, loadHistory, buildPayload, acquireLock, tryLock, emptyDay, ghostOf };
+module.exports = { absorb, isHumanPrompt, scan, loadHistory, buildPayload, acquireLock, tryLock, emptyDay, ghostOf, activeMinutes, flushAct, touchSession, countLines };

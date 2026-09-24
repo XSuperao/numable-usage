@@ -30,8 +30,9 @@ const jsonl = (...rows) => rows.map((r) => JSON.stringify(r) + '\n').join('');
 
 const run = (rows) => {
   const days = {};
-  const recent = [];
-  for (const r of rows) C.absorb(days, r, recent);
+  const st = { recent: [], rt: [] };
+  for (const r of rows) C.absorb(days, r, st);
+  C.flushAct();
   return days[DAY] || C.emptyDay();
 };
 
@@ -125,11 +126,11 @@ test('超过 64KB 的长行也能定位到行尾', async () => {
   assert.equal(h.days[DAY].msgs, 1);
 });
 
-test('读到 v1 历史直接丢弃（旧口径数字虚高，不与新口径混用）', () => {
+test('读到旧版本历史直接丢弃（旧口径数字虚高，不与新口径混用）', () => {
   const p = path.join(tmp(), 'h.json');
   fs.writeFileSync(p, JSON.stringify({ v: 1, files: { x: { off: 5 } }, days: { [DAY]: { msgs: 999 } } }));
   const h = C.loadHistory(p);
-  assert.equal(h.v, 2);
+  assert.equal(h.v, 3);
   assert.deepEqual(h.days, {});
   assert.deepEqual(h.files, {});
 });
@@ -287,7 +288,7 @@ test('--devices 标出分身、--forget 拒删本机并只删点名的那个', a
   fs.mkdirSync(state);
   const localDays = {};
   for (let i = 1; i <= 6; i++) localDays[`2026-09-0${i}`] = { ...C.emptyDay(), sess: Array.from({ length: i }, (_, k) => `s${i}${k}`) };
-  fs.writeFileSync(path.join(state, 'history.json'), JSON.stringify({ v: 2, files: {}, days: localDays }));
+  fs.writeFileSync(path.join(state, 'history.json'), JSON.stringify({ v: 3, files: {}, days: localDays }));
   fs.writeFileSync(path.join(state, 'config.json'), JSON.stringify({ spaceId: 'x', writeToken: 'W', readToken: 'R', device: 'aaaaaaaaaaaa' }));
   const mk = (device, f) => ({ device, updatedAt: 1, totals: { msgs: 1, out: 1 },
     days: Object.entries(localDays).map(([date, v]) => ({ date, sessions: f(v.sess.length) })) });
@@ -456,4 +457,89 @@ test('--link / --join：第二台电脑并进同一空间，保留自己的设�
   assert.equal(ing.body.device, 'bbbbbbbbbbbb');
 
   assert.match(await cliB('--join', code), /已经在这个空间里了/);
+});
+
+test('工具调用：逐行数（同一响应多行各带一个块），按调用 id 去重；MCP 并成 MCP、词表外并成 Other', () => {
+  const tu = (id, name, extra = {}) => ({ ...asst('m1', 'r1', 5), message: { id: 'm1', model: 'claude-opus-5',
+    usage: { input_tokens: 1, output_tokens: 5 }, content: [{ type: 'tool_use', id, name, input: {} }] }, ...extra });
+  const d = run([tu('t1', 'Bash'), tu('t2', 'Bash'), tu('t2', 'Bash'), tu('t3', 'mcp__slack__post'), tu('t4', 'Task'), tu('t5', 'MyCustomThing')]);
+  assert.deepEqual(d.tools, { Bash: 2, MCP: 1, Agent: 1, Other: 1 });
+  assert.deepEqual(run([tu('a', 'TaskCreate'), tu('b', 'TodoWrite'), tu('c', 'SendMessage')]).tools, { Todo: 2, Agent: 1 });
+  assert.equal(d.out, 5);                                  // 五行同一响应：token 仍只计一次
+});
+
+test('代码改动行数：补丁数 + / -，新建文件数行数，报错结果不算', () => {
+  const tr = (r) => ({ ...toolResult(), toolUseResult: r });
+  const d = run([
+    tr({ structuredPatch: [{ lines: [' a', '-b', '+c', '+d'] }, { lines: ['-e'] }] }),
+    tr({ type: 'create', content: 'x\ny\nz\n', structuredPatch: [] }),
+    tr('Error: file not found'),
+  ]);
+  assert.deepEqual([d.la, d.lr], [5, 2]);
+});
+
+test('缓存 / 思考 / 子代理 / 联网 / 快速模式分项', () => {
+  const a = (id, extra, u) => ({ ...asst(id, 'r', 0), ...extra, message: { id, model: 'claude-opus-5', usage: u } });
+  const d = run([
+    a('m1', {}, { input_tokens: 1, output_tokens: 100, cache_creation_input_tokens: 30, cache_read_input_tokens: 500,
+      cache_creation: { ephemeral_1h_input_tokens: 10, ephemeral_5m_input_tokens: 20 },
+      output_tokens_details: { thinking_tokens: 40 }, server_tool_use: { web_search_requests: 2, web_fetch_requests: 1 } }),
+    a('m2', { isSidechain: true }, { input_tokens: 0, output_tokens: 7 }),
+    a('m3', {}, { input_tokens: 2, output_tokens: 9, speed: 'fast' }),
+  ]);
+  assert.deepEqual([d.cr, d.c1, d.rd, d.th, d.so, d.ws, d.wf], [30, 10, 500, 40, 7, 2, 1]);
+  assert.deepEqual(d.byModel['claude-opus-5'], { in: 1, out: 107, c5: 20, c1: 10, rd: 500, msgs: 2 });
+  assert.equal(d.byModel['claude-opus-5@fast'].out, 9);
+});
+
+test('活跃分钟：5 分钟内的空档算连续，两个会话同时开着不重复算', () => {
+  const at = (hhmm, sid = 's1') => ({ ...user('x'), sessionId: sid, timestamp: new Date(`2026-09-20T${hhmm}:00`).toISOString() });
+  const days = {};
+  const st = { recent: [], rt: [] };
+  const ext = C.loadHistory('/nonexistent');
+  for (const r of [at('10:00'), at('10:03'), at('10:03', 's2'), at('10:20'), at('10:21', 's2')]) C.absorb(days, r, st, ext);
+  C.flushAct();
+  // 10:00–10:03 连续 4 分钟；10:20–10:21 连续 2 分钟（10:03→10:20 超过 5 分钟，断开）
+  assert.equal(C.activeMinutes(days['2026-09-20'].act), 6);
+  // 会话 s1：10:00→10:03 连续（+3 分钟），10:03→10:20 断开只记 1 分钟 → 1+3+1 = 5 分钟
+  assert.equal(Math.round(ext.sessions.s1[2] / 60000), 5);
+});
+
+test('5 小时窗口：从整点起算、持续 5 小时；窗口过了就没有', () => {
+  const now = Date.now();
+  const h = C.loadHistory('/nonexistent');
+  h.events = [[now - 2 * 3600e3, 'claude-opus-5', 1, 100, 0, 0, 50], [now - 60e3, 'claude-opus-5', 1, 50, 0, 0, 0]];
+  const w = C.buildPayload(h, 'd').snapshot.window;
+  assert.ok(w && w.s === Math.floor((now - 2 * 3600e3) / 3600e3) * 3600e3 && w.e === w.s + 5 * 3600e3);
+  assert.equal(w.m['claude-opus-5'].out, 150);
+  h.events = [[now - 7 * 3600e3, 'claude-opus-5', 1, 100, 0, 0, 0]];
+  assert.equal(C.buildPayload(h, 'd').snapshot.window, null);
+});
+
+test('按项目：默认只有匿名编号，打开开关才带文件夹名；worktree 归回所属项目', () => {
+  const days = {};
+  const st = { recent: [], rt: [] };
+  const ext = C.loadHistory('/nonexistent');
+  C.absorb(days, { ...asst('m1', 'r', 10), cwd: '/tmp/nbu-proj-a' }, st, ext);
+  C.absorb(days, { ...asst('m2', 'r', 20), cwd: '/tmp/nbu-proj-a/.claude/worktrees/feature-x' }, st, ext);
+  C.absorb(days, { ...asst('m3', 'r', 5), cwd: '/tmp/nbu-proj-b' }, st, ext);
+  C.flushAct();
+  ext.days = days;
+  const anon = C.buildPayload(ext, 'd').snapshot.projects;
+  assert.equal(anon.length, 2);
+  assert.ok(anon.every((p) => /^[a-f0-9]{10}$/.test(p.id) && !('name' in p)));
+  assert.equal(anon[0].out, 30);                            // worktree 并进 proj-a
+  assert.ok(!JSON.stringify(C.buildPayload(ext, 'd').snapshot).includes('nbu-proj'));
+  const named = C.buildPayload(ext, 'd', { projectNames: true }).snapshot.projects;
+  assert.deepEqual(named.map((p) => p.name), ['nbu-proj-a', 'nbu-proj-b']);
+});
+
+test('锁：对方刚建出锁文件、还没写进程号时不许抢（空内容 ≠ 持锁进程已死）', () => {
+  const lock = path.join(tmp(), 'lock');
+  fs.writeFileSync(lock, '');
+  assert.equal(C.tryLock(lock), false);
+  // 空内容且已很久没动过（对方写到一半就崩了）→ 可以抢
+  const old = new Date(Date.now() - 60000);
+  fs.utimesSync(lock, old, old);
+  assert.equal(C.tryLock(lock), true);
 });

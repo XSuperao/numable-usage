@@ -135,10 +135,60 @@ console.log('\n── ?today= 以看的人那天为锚 ──');
   ok(e.totals.streak === 0 && e.today.msgs === 0, '隔了一天没用 → 连续天数归 0');
 }
 
+console.log('\n── v2 快照：费用 / 周期 / 打卡 / 工具 / 构成 / 窗口 / 项目 ──');
+{
+  const iso = (off) => new Date(Date.now() + off * 864e5).toISOString().slice(0, 10);
+  const D0 = iso(0);
+  const sp3 = await post('/space');
+  const W3 = sp3.j.writeToken, R3 = sp3.j.readToken;
+  const M = (o) => ({ in: 0, out: 0, c5: 0, c1: 0, rd: 0, n: 1, ...o });
+  const now = Date.now();
+  const snap = {
+    v: 2,
+    days: [
+      { date: D0, msgs: 5, sessions: 1, out: 200000, in: 2000000, cacheCreate: 0, rd: 2000000, ws: 3, la: 40, lr: 7, am: 95,
+        th: 50000, so: 20000, h: { '9': 3, '24': 9, x: 1 }, t: { Bash: 5, Edit: 2, 'bad name!': 9 },
+        m: { 'claude-opus-5': M({ in: 1e6, out: 1e5, rd: 1e6 }), 'claude-opus-5@fast': M({ in: 1e6, out: 1e5, rd: 1e6 }),
+             'claude-foo-9': M({ out: 7 }) } },
+      { date: iso(-8), msgs: 1, sessions: 1, out: 1000, in: 0, cacheCreate: 0 },   // 老插件推的一天：没有 m
+    ],
+    window: { s: now - 30 * 60e3, e: now + 270 * 60e3, l: now - 60e3, n: 4, m: { 'claude-opus-5': M({ out: 1e5 }) } },
+    sessStats: { n: 4, avgMin: 30, maxMin: 90 },
+    projects: [{ id: 'abcdef1234', name: 'my\u0007app', out: 10, tok: 100, n: 1, d7out: 10, d7tok: 100 },
+               { id: 'NOT-HEX', out: 99, tok: 999, n: 1 }],
+  };
+  const ing = await post('/ingest', { source: 'claude-code', device: 'cccc0001', snapshot: snap }, W3);
+  ok(ing.s === 200, 'v2 快照被接受');
+  const r = await J(`/s?today=${D0}&lite=1`, { headers: { authorization: 'Bearer ' + R3 } });
+  const m = r.j.merged;
+  ok(r.s === 200 && !('sources' in r.j), '✦ ?lite=1 不带各设备原样快照');
+  ok(m.periods.today.usd === 24.03, `✦ 今天费用 = $8（Opus 5）+ $16（快速模式翻倍）+ $0.03（3 次搜索）= 24.03（${m.periods.today.usd}）`);
+  ok(m.periods.today.unpriced === 7, `表外模型不猜价，记为未计价 token（${m.periods.today.unpriced}）`);
+  ok(m.periods.d30.partial === true && m.periods.today.partial === false, '✦ 老插件推的日子标 partial（折算不了），新的不标');
+  ok(m.periods.today.la === 40 && m.periods.today.am === 95, '改动行数 / 活跃分钟进周期汇总');
+  ok(m.costModels[0].name === 'claude-opus-5' && m.costModels[0].usd === 24 && m.costModels[0].fastOut === 1e5,
+    `✦ 按模型费用把快速模式并回同一模型（${JSON.stringify(m.costModels[0])}）`);
+  ok(m.models.every((x) => !/@fast/.test(x.name)), '模型分布里没有 @fast 行');
+  ok(JSON.stringify(m.tools) === JSON.stringify([{ name: 'Bash', n: 5, pct: 71.4 }, { name: 'Edit', n: 2, pct: 28.6 }]),
+    `✦ 工具排行（非法工具名被白名单丢掉）${JSON.stringify(m.tools)}`);
+  const wd = new Date(D0 + 'T00:00:00Z').getUTCDay();
+  ok(m.punch.length === 168 && m.punch[wd * 24 + 9] === 3 && m.punchMax === 3, '✦ 打卡图按日期推星期几，非法小时键被丢');
+  ok(m.composition.hitRate === 50 && m.composition.thinkPct === 24.9, `token 构成：命中率 50%、思考占 24.9%（50000 / 201000）（${m.composition.hitRate} / ${m.composition.thinkPct}）`);
+  ok(m.window && m.window.usd === 2.5 && m.window.projUsd >= 24.9 && m.window.projUsd <= 25, `✦ 5 小时窗口：已用 $2.5，开窗 30 分钟按速外推 $25（${JSON.stringify(m.window)}）`);
+  ok(m.sessions.avgMin === 30 && m.sessions.maxMin === 90, '会话时长');
+  ok(m.periods.today.usdS === '$24.03' && m.window.usdS === '$2.50' && m.periods.d7p.usdS === '$0', `美元显示串（${m.periods.today.usdS} / ${m.window.usdS} / ${m.periods.d7p.usdS}）`);
+  ok(m.projects.length === 1 && m.projects[0].name === 'myapp', `✦ 项目：非法编号丢弃、名字去控制字符（${JSON.stringify(m.projects)}）`);
+  ok(m.days.every((d) => !('x' in d)) && !('x' in m.today), '内部明细不下发到 days / today');
+  const dd = m.days.find((d) => d.date === D0), od = m.days.find((d) => d.date === iso(-8));
+  ok(dd.usd === 24.03 && dd.am === 95 && dd.la === 40 && od.usd === null, `✦ 逐日带费用 / 活跃 / 改动，老插件那天费用为 null（${dd.usd} / ${od.usd}）`);
+  const old = (await J('/s', { headers: { authorization: 'Bearer ' + R3 } })).j;
+  ok(Array.isArray(old.sources['claude-code']) && old.merged.today.date === D0, '不带 lite / today 的老调用照旧');
+}
+
 console.log('\n── 体积与设备数上限 ──');
 const big = { source: 'claude-code', device: 'aabbcc112233',
-  snapshot: { days: [], byModel: {}, hours: {}, totals: {}, pad: 'x'.repeat(70000) } };
-ok((await post('/ingest', big, writeToken)).s === 413, '超 64KB → 413');
+  snapshot: { days: [], byModel: {}, hours: {}, totals: {}, pad: 'x'.repeat(270000) } };
+ok((await post('/ingest', big, writeToken)).s === 413, '超 256KB → 413');
 ok((await post('/ingest', { source: 'nope', snapshot: {} }, writeToken)).s === 400, '未知 source → 400');
 
 console.log(`\n${fail === 0 ? '✅' : '❌'}  pass ${pass} · fail ${fail}\n`);

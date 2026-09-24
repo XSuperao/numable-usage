@@ -11,6 +11,8 @@ description: 查看 Numable 用量小组件的接入状态、取出接入所需�
 - 「另一台电脑也要算进来 / 多台电脑合并」且**当前这台已经接好** → 运行 `node "${CLAUDE_PLUGIN_ROOT}/scripts/collect.cjs" --link`
 - 「加入用量空间」且用户贴了一串以 `nu1.` 开头的字符 → 运行 `node "${CLAUDE_PLUGIN_ROOT}/scripts/collect.cjs" --join <那一串>`
   （原样传入，不要改动；这台电脑原来的空间会被替换）
+- 「项目名 / 显示项目名字 / 按项目」→ 运行 `node "${CLAUDE_PLUGIN_ROOT}/scripts/collect.cjs" --projects` 看现状；
+  用户明确要打开才运行 `--projects on`，要关才运行 `--projects off`（打开会上传项目文件夹名，先告诉用户这一点）
 - 「有哪些设备 / 数字偏大 / 翻倍 / 算重了 / 电脑改过名」→ 运行 `node "${CLAUDE_PLUGIN_ROOT}/scripts/collect.cjs" --devices`
 - 「删掉 / 忘记某个设备」→ **先**运行 `--devices` 把列表给用户看；等用户明确说出要删的那个标识后，
   才运行 `node "${CLAUDE_PLUGIN_ROOT}/scripts/collect.cjs" --forget <标识>`。
