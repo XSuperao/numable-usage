@@ -9,6 +9,7 @@
  *   POST /space                     → { spaceId, writeToken, readToken, code }
  *   POST /ingest  Bearer<write>     → { ok }
  *   POST /code    Bearer<write>     → { code }
+ *   POST /forget  Bearer<write>     { source, device } → { ok, removed }   删掉一个设备行
  *   POST /claim   { code }          → { readToken }
  *   GET  /s       Bearer<read>      → { updatedAt, sources }
  *   GET  /health
@@ -304,6 +305,25 @@ async function handle(req, env, ctx) {
         .bind(space.space_id, now),
     ]);
     return json({ ok: true, days: clean.days.length });
+  }
+
+  // ---- 忘记一个设备 ----
+  // 同一台机器换了主机名（macOS 没设 HostName 时随网络变）会在这里留下「分身」行，
+  // 而读取时按天相加 → 重复计算；分身攒多了还会撞 MAX_ROWS_PER_SPACE 让推送被拒。
+  // 只能删自己空间里的行（spaceId 来自令牌），要写令牌 —— 读令牌在手机上，不许它删数据。
+  if (p === '/forget' && req.method === 'POST') {
+    const spaceId = await verifyToken(env, 'w', bearer(req));
+    if (!spaceId) return err('unauthorized', 401);
+    if (!(await allow(env, `fg:${spaceId}`, 10))) return err('rate_limited', 429);
+    let body; try { body = await req.json(); } catch { return err('bad_json'); }
+    if (!body || !SOURCES[body.source]) return err('unknown_source');
+    const device = body.device;
+    if (typeof device !== 'string' || !(/^[a-f0-9]{4,32}$/.test(device) || device === 'default')) {
+      return err('bad_device');
+    }
+    const del = await env.DB.prepare('DELETE FROM snapshots WHERE space_id=?1 AND source=?2 AND device=?3')
+      .bind(spaceId, body.source, device).run();
+    return json({ ok: true, removed: (del.meta && del.meta.changes) || 0 });
   }
 
   // ---- 重新生成短码 ----

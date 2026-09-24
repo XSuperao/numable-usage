@@ -267,3 +267,70 @@ test('设备标识首次写进 config，之后固定用它（主机名变了也�
   await runOnce();
   assert.equal(seen[1], 'abc123abc123');
 });
+
+test('分身判据：重叠日会话数基本一致才算，真正的另一台电脑不算', () => {
+  const local = {};
+  for (let i = 1; i <= 10; i++) local[`2026-09-${String(i).padStart(2, '0')}`] = { sess: Array.from({ length: i % 4 + 1 }, (_, k) => `s${i}${k}`) };
+  const days = (f) => Object.entries(local).map(([date, v]) => ({ date, sessions: f(v.sess.length) }));
+  assert.equal(C.ghostOf(local, days((n) => n)).likely, true);
+  // 分身停推那天只推了半天：10 天里错一天仍算
+  const partial = days((n) => n); partial[9].sessions = 0;
+  assert.equal(C.ghostOf(local, partial).likely, true);
+  assert.equal(C.ghostOf(local, days((n) => n + 1)).likely, false);   // 另一台电脑
+  assert.equal(C.ghostOf(local, days((n) => n).slice(0, 2)).likely, false); // 重叠太少不下结论
+  assert.equal(C.ghostOf(local, [{ date: '2026-08-01', sessions: 3 }]).likely, false); // 没重叠
+});
+
+test('--devices 标出分身、--forget 拒删本机并只删点名的那个', async (t) => {
+  const home = tmp();
+  const state = path.join(home, 'state');
+  fs.mkdirSync(state);
+  const localDays = {};
+  for (let i = 1; i <= 6; i++) localDays[`2026-09-0${i}`] = { ...C.emptyDay(), sess: Array.from({ length: i }, (_, k) => `s${i}${k}`) };
+  fs.writeFileSync(path.join(state, 'history.json'), JSON.stringify({ v: 2, files: {}, days: localDays }));
+  fs.writeFileSync(path.join(state, 'config.json'), JSON.stringify({ spaceId: 'x', writeToken: 'W', readToken: 'R', device: 'aaaaaaaaaaaa' }));
+  const mk = (device, f) => ({ device, updatedAt: 1, totals: { msgs: 1, out: 1 },
+    days: Object.entries(localDays).map(([date, v]) => ({ date, sessions: f(v.sess.length) })) });
+
+  const forgets = [];
+  const server = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => { b += c; });
+    req.on('end', () => {
+      res.setHeader('content-type', 'application/json');
+      if (req.method === 'GET' && req.url === '/s') {
+        assert.equal(req.headers.authorization, 'Bearer R');            // 列设备只用读令牌
+        return res.end(JSON.stringify({ sources: { 'claude-code': [
+          mk('aaaaaaaaaaaa', (n) => n), mk('bbbbbbbbbbbb', (n) => n), mk('cccccccccccc', (n) => n + 3)] } }));
+      }
+      if (req.method === 'POST' && req.url === '/forget') {
+        forgets.push({ auth: req.headers.authorization, body: JSON.parse(b) });
+        return res.end('{"ok":true,"removed":1}');
+      }
+      res.statusCode = 404; res.end('{}');
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const env = { ...process.env, HOME: home, NUMABLE_USAGE_STATE_DIR: state,
+                NUMABLE_USAGE_ENDPOINT: `http://127.0.0.1:${server.address().port}` };
+  const cli = (...args) => new Promise((resolve) => {
+    const p = spawn(process.execPath, [SCRIPT, ...args], { env });
+    let out = '';
+    p.stdout.on('data', (c) => { out += c; });
+    p.on('close', () => resolve(out));
+  });
+
+  const list = await cli('--devices');
+  assert.match(list, /aaaaaaaaaaaa（本机）/);
+  assert.match(list, /--forget bbbbbbbbbbbb/);
+  assert.doesNotMatch(list, /--forget cccccccccccc/);                   // 另一台电脑不建议删
+  assert.doesNotMatch(list, /--forget aaaaaaaaaaaa/);
+
+  assert.match(await cli('--forget', 'aaaaaaaaaaaa'), /这是本机/);
+  assert.match(await cli('--forget', 'not-a-device'), /用法/);
+  assert.equal(forgets.length, 0);                                       // 上面两次都不许发请求
+
+  assert.match(await cli('--forget', 'bbbbbbbbbbbb'), /已删除设备 bbbbbbbbbbbb/);
+  assert.deepEqual(forgets, [{ auth: 'Bearer W', body: { source: 'claude-code', device: 'bbbbbbbbbbbb' } }]);
+});

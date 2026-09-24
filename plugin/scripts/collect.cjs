@@ -310,6 +310,31 @@ function prune(history) {
   for (const f of Object.keys(history.files)) if (!fs.existsSync(f)) delete history.files[f];
 }
 
+// ---------- 设备 ----------
+/** 本机的设备标识：config 里钉住的那个；老 config 还没钉时按原公式算（与推送时写回的值相同）。 */
+const deviceId = (cfg) => (cfg && typeof cfg.device === 'string' && cfg.device)
+  || crypto.createHash('sha256')
+    .update(os.hostname() + '|' + os.userInfo().username)   // 主机名常含真名 —— 只上报 hash
+    .digest('hex').slice(0, 12);
+
+/**
+ * 另一个设备是不是「本机改名前留下的分身」：它与本机历史重叠 ≥ 3 天，
+ * 且重叠日里至少八成的会话数逐日相同（留余量给分身停推那天 —— 那天它只推了半天）。
+ * 真正的另一台电脑跑的是另一批会话，不会连续多天恰好一样多。
+ */
+function ghostOf(localDays, remoteDays) {
+  let overlap = 0, same = 0;
+  for (const d of remoteDays || []) {
+    const mine = localDays[d.date];
+    if (!mine) continue;
+    const n = Array.isArray(mine.sess) ? mine.sess.length : 0;
+    if (!n && !(d.sessions | 0)) continue;           // 两边都没会话的日子不算证据
+    overlap++;
+    if (n === (d.sessions | 0)) same++;
+  }
+  return { overlap, same, likely: overlap >= 3 && same >= overlap * 0.8 };
+}
+
 // ---------- 显式白名单构造 payload ----------
 /** 只有这里列出的字段会离开本机。新增字段必须显式加在这里。 */
 function buildPayload(history, device) {
@@ -374,17 +399,21 @@ function buildPayload(history, device) {
 }
 
 // ---------- 网络 ----------
-async function post(pathname, body, token) {
-  const headers = { 'content-type': 'application/json' };
+async function request(method, pathname, body, token) {
+  const headers = {};
+  if (body !== undefined) headers['content-type'] = 'application/json';
   if (token) headers.authorization = `Bearer ${token}`;
   // 必须有超时：服务端挂住时 hook 会一直卡着，而且期间一直持锁
   const res = await fetch(ENDPOINT + pathname, {
-    method: 'POST', headers, body: JSON.stringify(body || {}), signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+    method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(POST_TIMEOUT_MS),
   });
   const text = await res.text();
   let json = null; try { json = JSON.parse(text); } catch { /* 非 JSON */ }
   return { ok: res.ok, status: res.status, json, text };
 }
+const post = (pathname, body, token) => request('POST', pathname, body || {}, token);
+const get = (pathname, token) => request('GET', pathname, undefined, token);
 
 // ---------- 子命令 ----------
 const fmt = (n) => (n >= 1e9 ? (n / 1e9).toFixed(1) + 'B' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M'
@@ -408,6 +437,7 @@ async function cmdStatus() {
   console.log(`会话 ${sess} · 消息 ${fmt(msgs)} · 输出 token ${fmt(out)}`);
   console.log(`服务端 ${cfg.endpoint || ENDPOINT}`);
   console.log('\n把用量接到 Numable：--token 打印读取令牌（粘进 App 的凭证设置）。');
+  console.log('数字比实际偏大？--devices 看看有没有这台电脑改名前留下的旧记录。');
 }
 
 /**
@@ -432,12 +462,69 @@ async function cmdCode() {
   printOnboarding(r.json.code, console.log);
 }
 
+async function cmdDevices() {
+  const cfg = readJson(CONFIG, null);
+  if (!cfg || !cfg.readToken) { console.log('尚未接入，先跑一次采集（或在 Claude Code 里开一个新会话）。'); return; }
+  const me = deviceId(cfg);
+  let r;
+  try { r = await get('/s', cfg.readToken); } catch (e) { console.log('连不上服务端：', e && e.message); return; }
+  if (!r.ok || !r.json) { console.log('读取失败：', r.status, r.text.slice(0, 200)); return; }
+  const list = ((r.json.sources || {})['claude-code'] || []).slice()
+    .sort((a, b) => (a.device === me ? -1 : b.device === me ? 1 : (b.updatedAt || 0) - (a.updatedAt || 0)));
+  if (!list.length) { console.log('服务端还没有任何设备的数据。'); return; }
+
+  const local = loadHistory().days;
+  const ghosts = [];
+  console.log(`你的空间里有 ${list.length} 台设备在推送用量（App 会把它们的数字加在一起）：\n`);
+  for (const dev of list) {
+    const days = (dev.days || []).map((d) => d.date).sort();
+    const t = dev.totals || {};
+    const when = dev.updatedAt ? new Date(dev.updatedAt).toLocaleString('zh-CN', { hour12: false }) : '—';
+    console.log(`  ${dev.device}${dev.device === me ? '（本机）' : ''}`);
+    console.log(`    最近推送 ${when} · ${days.length ? `${days[0]} → ${days[days.length - 1]}，${days.length} 天` : '没有日数据'}` +
+                ` · 消息 ${fmt(t.msgs | 0)} · 输出 token ${fmt(t.out | 0)}`);
+    if (dev.device !== me) {
+      const g = ghostOf(local, dev.days);
+      if (g.likely) {
+        ghosts.push(dev.device);
+        console.log(`    ⚠ 与本机有 ${g.overlap} 天重叠，其中 ${g.same} 天的会话数完全相同 ——` +
+                    '多半是这台电脑改名前留下的旧记录，这些天的用量被算了两遍。');
+      }
+    }
+    console.log('');
+  }
+  if (ghosts.length) {
+    console.log('删掉旧记录（只删服务端那一份，本机数据不受影响）：');
+    for (const id of ghosts) console.log(`  --forget ${id}`);
+  }
+}
+
+async function cmdForget(id) {
+  const cfg = readJson(CONFIG, null);
+  if (!cfg || !cfg.writeToken) { console.log('尚未接入，先跑一次采集。'); return; }
+  if (typeof id !== 'string' || !/^[a-f0-9]{4,32}$/.test(id)) {
+    console.log('用法：--forget <设备标识>（标识用 --devices 查看）'); return;
+  }
+  if (id === deviceId(cfg)) {
+    console.log('这是本机。删掉之后，下一次会话开始或结束时又会重新推上去，不需要删。'); return;
+  }
+  let r;
+  try { r = await post('/forget', { source: 'claude-code', device: id }, cfg.writeToken); }
+  catch (e) { console.log('连不上服务端：', e && e.message); return; }
+  if (!r.ok || !r.json) { console.log('删除失败：', r.status, r.text.slice(0, 200)); return; }
+  console.log(r.json.removed
+    ? `已删除设备 ${id}。Numable 下次刷新时就不再计入它。`
+    : `服务端没有设备 ${id}（可能已经删过了）。`);
+}
+
 // ---------- 主流程 ----------
 async function main() {
   const arg = process.argv[2];
   if (arg === '--status') return cmdStatus();
   if (arg === '--code') return cmdCode();
   if (arg === '--token') return cmdToken();
+  if (arg === '--devices') return cmdDevices();
+  if (arg === '--forget') return cmdForget(process.argv[3]);
   if (arg === '--run' || DEBUG) return runCollect();
 
   // hook 入口：把采集甩给一个脱离会话的后台进程，自己立刻退出。
@@ -495,9 +582,7 @@ async function collectAndPush() {
   // ⚠️ macOS 没设 HostName 时 os.hostname() 随网络变（DHCP / Bonjour 名），
   // 每变一次服务端就多出一行「设备」，App 按天合并各设备 → 同一台机器的日子被重复计算。
   if (!cfg.device) {
-    cfg.device = crypto.createHash('sha256')
-      .update(os.hostname() + '|' + os.userInfo().username)   // 主机名常含真名 —— 只上报 hash
-      .digest('hex').slice(0, 12);
+    cfg.device = deviceId(cfg);
     writeJson(CONFIG, cfg);
   }
   const device = cfg.device;
@@ -529,4 +614,4 @@ if (require.main === module) {
 }
 
 // 供测试用（hook 直接执行本文件，走上面那条）
-module.exports = { absorb, isHumanPrompt, scan, loadHistory, buildPayload, acquireLock, tryLock, emptyDay };
+module.exports = { absorb, isHumanPrompt, scan, loadHistory, buildPayload, acquireLock, tryLock, emptyDay, ghostOf };

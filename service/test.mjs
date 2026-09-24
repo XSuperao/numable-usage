@@ -83,6 +83,25 @@ for (let i = 0; i < 22; i++) {
 }
 ok(limited, '连续错码被 429 限流');
 
+console.log('\n── /forget 忘记设备 ──');
+const fg = (body, tok) => post('/forget', body, tok);
+ok((await fg({ source: 'claude-code', device: 'ddeeff445566' })).s === 401, '无 token → 401');
+ok((await fg({ source: 'claude-code', device: 'ddeeff445566' }, readToken)).s === 401, '✦ readToken 不能删（手机上那枚只许读）');
+ok((await fg({ source: 'nope', device: 'ddeeff445566' }, writeToken)).s === 400, '未知 source → 400');
+ok((await fg({ source: 'claude-code', device: "x' OR 1=1 --" }, writeToken)).s === 400, '非法 device → 400');
+// 别人的空间删不到这边：用另一个空间的 writeToken 删同名设备
+const other = await post('/space');
+const cross = await fg({ source: 'claude-code', device: 'ddeeff445566' }, other.j.writeToken);
+ok(cross.s === 200 && cross.j.removed === 0, '✦ 别的空间的 writeToken 删不到本空间的行');
+ok((await J('/s', { headers: { authorization: 'Bearer ' + readToken } })).j.sources['claude-code'].length === 2, '跨空间删除后本空间仍是两行');
+const rm = await fg({ source: 'claude-code', device: 'ddeeff445566' }, writeToken);
+ok(rm.s === 200 && rm.j.removed === 1, `删掉一行 (removed=${rm.j && rm.j.removed})`);
+const read3 = await J('/s', { headers: { authorization: 'Bearer ' + readToken } });
+const arr3 = read3.j.sources['claude-code'];
+ok(arr3.length === 1 && arr3[0].device === 'aabbcc112233', '✦ 只删了指定设备，另一台还在');
+ok(read3.j.merged.totals.msgs === 10, `✦ 合并结果不再含被删设备 (msgs=${read3.j.merged.totals.msgs})`);
+ok((await fg({ source: 'claude-code', device: 'ddeeff445566' }, writeToken)).j.removed === 0, '再删一次 → removed=0（幂等）');
+
 console.log('\n── 体积与设备数上限 ──');
 const big = { source: 'claude-code', device: 'aabbcc112233',
   snapshot: { days: [], byModel: {}, hours: {}, totals: {}, pad: 'x'.repeat(70000) } };
