@@ -425,6 +425,9 @@ function mergeClaudeCode(list, anchor) {
     }
   }
 
+  const { colorOf, ...ins } = insights(full, list, anchorDate, tot, models.map((x) => x.name));
+  // 模型分布每行带自己的颜色(「浅|深」串,组件直接用):颜色跟模型走,与页面、每日费用同一套钉槽 —— 不随排名变
+  for (const x of models) x.c = colorOf(x.name);
   return {
     days, models, hours, totals: tot, grid,
     gridStart: grid.length ? grid[0].d : '',
@@ -433,7 +436,7 @@ function mergeClaudeCode(list, anchor) {
     peakHour: peak ? Number(peak[0]) : -1,
     modelTop: models.length ? models[0].name : '',
     outMax: days.reduce((m, d) => Math.max(m, d.out), 0),
-    ...insights(full, list, anchorDate, tot),
+    ...ins,
   };
 }
 
@@ -442,7 +445,7 @@ function mergeClaudeCode(list, anchor) {
  * 全部以 anchorDate（看的人那天；老包 = 数据最后一天）为「今天」。日期都是采集机本地日期串，
  * 只做字符串比较与 UTC 纯日期运算，绝不按服务器时区换算。
  */
-function insights(full, list, anchorDate, tot = {}) {
+function insights(full, list, anchorDate, tot = {}, modelNames = []) {
   const DAY = 864e5;
   const ms = (d) => Date.parse(d + 'T00:00:00Z');
   const iso = (t) => new Date(t).toISOString().slice(0, 10);
@@ -666,11 +669,12 @@ function insights(full, list, anchorDate, tot = {}) {
       lines: chg(a.la + a.lr, b.la + b.lr), msgs: chg(a.msgs, b.msgs) }];
   })) : null;
 
-  const w = anchorDate && periods ? widgetsView({ anchorDate, back, agg, full, tot, periods, months, costModels,
+  const colorOf = modelColorer([...daily30Models, ...costModels.map((x) => x.name), ...modelNames]);
+  const w = anchorDate && periods ? widgetsView({ colorOf, anchorDate, back, agg, full, tot, periods, months, costModels,
     tools, composition, compositionPrev, punch, punchMax, sessions, projects, daily30, daily30Models, deltas }) : null;
 
   return { periods, months, best, costModels, tools, composition, compositionPrev, punch, punchMax, window, sessions,
-    projects, daily30, daily30Models, costBars, deltas, w, windows };
+    projects, daily30, daily30Models, costBars, deltas, w, windows, colorOf };
 }
 
 /* ─────────────── 组件视图 w（2026-09-24 组件扩充） ───────────────
@@ -732,21 +736,23 @@ const hm = (min) => { min = Math.max(0, Math.round(Number(min) || 0)); return { 
 const usdAxis = (v) => (v >= 100 || !Number.isInteger(v) ? usdS(v) : '$' + v);
 const hrs = (min) => { const h = (Number(min) || 0) / 60; return String(h >= 10 ? Math.round(h) : Math.round(h * 10) / 10); };
 
+/** 模型配色:与页面 buildColors 同一算法(钉槽优先,其余按出现顺序占空槽,占满了一律灰)。
+ *  names 的顺序要与页面 allModelNames() 一致:daily30Models → costModels → models */
+function modelColorer(names) {
+  const col = {}, used = new Set();
+  for (const n of names) if (n in PIN) { col[n] = PAL[PIN[n]]; used.add(PIN[n]); }
+  for (const n of names) {
+    if (col[n] || n === 'other') continue;
+    for (let s = 0; s < PAL.length; s++) if (!used.has(s)) { used.add(s); col[n] = PAL[s]; break; }
+  }
+  return (n) => col[n] || PAL_OTHER;
+}
+
 function widgetsView(I) {
   const { anchorDate, back, agg, full, tot, periods, months, costModels, tools, composition, compositionPrev,
     punch, punchMax, sessions, projects, daily30, daily30Models, deltas } = I;
 
-  // 模型配色：与页面 buildColors 同一算法（钉槽优先，其余按顺序占空槽，占满了一律灰）
-  const colorOf = (() => {
-    const names = [...daily30Models, ...costModels.map((x) => x.name)];
-    const col = {}, used = new Set();
-    for (const n of names) if (n in PIN) { col[n] = PAL[PIN[n]]; used.add(PIN[n]); }
-    for (const n of names) {
-      if (col[n] || n === 'other') continue;
-      for (let s = 0; s < PAL.length; s++) if (!used.has(s)) { used.add(s); col[n] = PAL[s]; break; }
-    }
-    return (n) => col[n] || PAL_OTHER;
-  })();
+  const colorOf = I.colorOf;
   const md = (d) => String(d || '').slice(5);
   const past = daily30.slice(0, -1);                          // 不含今天（还没过完，算进基线会拉低）
   const avgOf = (f) => { const v = past.map(f).filter((x) => x > 0); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : 0; };

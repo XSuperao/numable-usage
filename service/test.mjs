@@ -123,6 +123,8 @@ console.log('\n── ?today= 以看的人那天为锚 ──');
   ok(a.gridEnd === D0, `✦ 热力网格右下角是今天（${a.gridEnd}）`);
   ok(a.totals.streak === 3, `✦ 两台电脑轮流用，连续天数按合并日期算 = 3（${a.totals.streak}）`);
   ok(a.totals.longestStreak === 3, `最长连续 = 3（${a.totals.longestStreak}）`);
+  ok(a.models[0].c === '#2a78d6|#3987e5' && !('colorOf' in a),
+    `✦ 模型分布每行带颜色:没钉槽的模型按出现顺序占第一个空槽,与页面同一套(${a.models[0].c})`);
   ok(a.models.length === 1 && a.models[0].label === 'Opus 4', `✦ 带发布日期的模型名标成「Opus 4」，零用量的 other 不列（${JSON.stringify(a.models.map((m) => m.label))}）`);
 
   const b = (await rd('')).j.merged;
