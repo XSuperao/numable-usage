@@ -191,6 +191,7 @@ console.log('\n── 图表数据：逐日序列 / 迷你柱 / 变化值 ──
   const D0 = iso(0);
   const sp4 = await post('/space');
   const W4 = sp4.j.writeToken, R4 = sp4.j.readToken;
+  globalThis.__S4 = { W4, R4 };   // 下一段复用(建空间每分钟限 5 次,整套测试已经用满)
   const M = (o) => ({ in: 0, out: 0, c5: 0, c1: 0, rd: 0, n: 1, ...o });
   const day = (date, m, extra = {}) => ({ date, msgs: 1, sessions: 1, out: 1, in: 0, cacheCreate: 0, m, t: {}, h: {}, ...extra });
   await post('/ingest', { source: 'claude-code', device: 'dddd0001', snapshot: { v: 2, days: [
@@ -230,6 +231,35 @@ console.log('\n── 图表数据：逐日序列 / 迷你柱 / 变化值 ──
   ok(w.vsAvg.fill >= 0 && w.vsAvg.fill <= 1 && w.vsAvg.mk >= 0 && w.vsAvg.mk <= 1, '今天 vs 日均：比例都在 0~1');
   ok(m.daily30[29].t.Bash === 6 && m.daily30[20].t.Bash === 4 && Object.keys(m.daily30[28].t).length === 0, '✦ 逐日带各工具调用次数（工具详情页用）');
   ok(m.composition.cost && m.composition.cost.out === 11 && m.composition.cost.saved === 0, `✦ 按 token 类别拆费用：输出 Opus 4e5 × $25/M + Sonnet 1e5 × $10/M = $11（${JSON.stringify(m.composition.cost)}）`);
+}
+
+console.log('\n── 0.6.0:窗口历史 / 项目逐日 / 逐日小时分布 ──');
+{
+  const iso = (off) => new Date(Date.now() + off * 864e5).toISOString().slice(0, 10);
+  const D0 = iso(0);
+  const { W4: W6, R4: R6 } = globalThis.__S4;
+  const M = (o) => ({ in: 0, out: 0, c5: 0, c1: 0, rd: 0, n: 1, ...o });
+  const H = 3600e3, t0 = Math.floor(Date.now() / H) * H - 30 * H;
+  const snap = (dev, wins, proj) => ({ v: 2, days: [{ date: D0, msgs: 3, sessions: 1, out: 10, in: 0, cacheCreate: 0, h: { '9': 2, '22': 1 },
+      m: { 'claude-opus-5': M({ out: 10 }) }, t: {} }], windows: wins, projects: proj });
+  // 两台电脑:A 的窗口 [t0, t0+5h) 与 B 的 [t0+2h, t0+7h) 重叠 → 合成一个;A 还有一个更早的
+  await post('/ingest', { source: 'claude-code', device: 'eeee0001', snapshot: snap('a', [
+    { s: t0, e: t0 + 5 * H, l: t0 + H, n: 3, m: { 'claude-opus-5': M({ out: 4e4 }) } },
+    { s: t0 - 10 * H, e: t0 - 5 * H, l: t0 - 9 * H, n: 1, m: { 'claude-sonnet-5@fast': M({ out: 1e5 }) } },
+    { s: 5, e: 1, n: 1, m: {} }, 'junk'],
+    [{ id: 'abcdef1234', out: 50, tok: 90, n: 2, d7out: 50, days: { [D0]: 30, [iso(-2)]: 20, 'bad-date': 9 }, p30: 25,
+       m: { 'claude-opus-5': 40, 'claude-opus-5@fast': 10, 'bad model!': 3 } }]) }, W6);
+  await post('/ingest', { source: 'claude-code', device: 'eeee0002', snapshot: snap('b', [
+    { s: t0 + 2 * H, e: t0 + 7 * H, l: t0 + 3 * H, n: 2, m: { 'claude-opus-5': M({ out: 4e4 }) } }], []) }, W6);
+  const m = (await J(`/s?today=${D0}&lite=1`, { headers: { authorization: 'Bearer ' + R6 } })).j.merged;
+  ok(m.windows.length === 2 && m.windows[0].s === t0 && m.windows[0].n === 5 && m.windows[0].usd === 2,
+    `✦ 窗口历史:两台电脑重叠的窗口合成一个(回复 3+2,输出 8e4 × $25/M = $2),非法窗口丢弃(${JSON.stringify(m.windows.map((x) => [x.s - t0, x.n, x.usd]))})`);
+  ok(m.windows[1].models[0].name === 'claude-sonnet-5' && m.windows[1].usd === 2, `✦ 窗口按模型:快速模式并回同一模型、单价翻倍(${JSON.stringify(m.windows[1].models)})`);
+  const pj = m.projects[0];
+  ok(pj.has30 && pj.d30.length === 30 && pj.d30[29] === 30 && pj.d30[27] === 20 && pj.out30 === 50 && pj.chg30.s === '↑100%',
+    `✦ 项目逐日:与 daily30 对齐,非法日期丢弃,比前 30 天(${JSON.stringify({ d: pj.d30.slice(26), out30: pj.out30, chg: pj.chg30 })})`);
+  ok(JSON.stringify(pj.models) === JSON.stringify([{ name: 'claude-opus-5', out: 50 }]), `项目按模型:快速模式并回、非法模型名丢弃(${JSON.stringify(pj.models)})`);
+  ok(m.daily30[29].h['9'] === 4 && m.daily30[29].h['22'] === 2, '✦ 逐日带小时分布(两台电脑相加)');
 }
 
 console.log('\n── 体积与设备数上限 ──');

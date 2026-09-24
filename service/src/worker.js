@@ -168,13 +168,23 @@ function sanitizeClaudeCode(s) {
   if (w && typeof w === 'object' && int(w.e) > int(w.s)) {
     window = { s: int(w.s), e: int(w.e), l: int(w.l), n: int(w.n), m: modelMap(w.m) };
   }
+  // 0.6.0 起:近 14 天的窗口历史(窗口详情页)
+  const windows = [];
+  if (Array.isArray(s.windows)) {
+    for (const x of s.windows.slice(0, 60)) {
+      if (!x || typeof x !== 'object' || !(int(x.e) > int(x.s))) continue;
+      windows.push({ s: int(x.s), e: int(x.e), l: int(x.l), n: int(x.n), m: modelMap(x.m) });
+    }
+  }
   const ss = s.sessStats && typeof s.sessStats === 'object' ? s.sessStats : {};
   const sessStats = { n: int(ss.n), avgMin: int(ss.avgMin), maxMin: int(ss.maxMin) };
   const projects = [];
   if (Array.isArray(s.projects)) {
     for (const p of s.projects.slice(0, 12)) {
       if (!p || typeof p !== 'object' || typeof p.id !== 'string' || !PROJ_RE.test(p.id)) continue;
-      const row = { id: p.id, out: int(p.out), tok: int(p.tok), n: int(p.n), d7out: int(p.d7out), d7tok: int(p.d7tok) };
+      const row = { id: p.id, out: int(p.out), tok: int(p.tok), n: int(p.n), d7out: int(p.d7out), d7tok: int(p.d7tok),
+        // 0.6.0 起:近 30 天逐日输出 / 前 30 天合计 / 近 30 天按模型输出(项目详情页)
+        days: intMap(p.days, (k) => DATE_RE.test(k), 31), p30: int(p.p30), m: intMap(p.m, (k) => MODEL_RE.test(k), 8) };
       const name = cleanName(p.name);
       if (name) row.name = name;
       projects.push(row);
@@ -188,6 +198,7 @@ function sanitizeClaudeCode(s) {
     byModel,
     hours,
     window,
+    windows,
     sessStats,
     projects,
     totals: {
@@ -255,6 +266,15 @@ function costParts(m) {
   }
   for (const f of Object.keys(r)) r[f] = r2(r[f]);
   return { ...r, savedS: usdS(r.saved) };
+}
+/** 一个窗口按模型的费用(快速模式并回同一模型),费用高的在前 */
+function winModels(m) {
+  const r = {};
+  for (const [k, v] of Object.entries(m || {})) {
+    const b = r[baseModel(k)] || (r[baseModel(k)] = { name: baseModel(k), usd: 0, out: 0 });
+    b.usd += priceOf(k, v) || 0; b.out += v.out || 0;
+  }
+  return Object.values(r).map((x) => ({ ...x, usd: r2(x.usd) })).sort((a, b) => b.usd - a.usd);
 }
 /** 一组按模型明细的总价：{ usd, unpriced: 表外模型的输出 token 数 } */
 function costOfModels(m) {
@@ -538,7 +558,7 @@ function insights(full, list, anchorDate, tot = {}) {
       for (const [k, v] of Object.entries(parts)) partsAll[k] = (partsAll[k] || 0) + v;
       // t = 这一天各工具的调用次数（工具详情页的逐日柱、这一天页的「用了哪些工具」）
       daily30.push({ d: date, usd: r2(usd), out: d ? d.out : 0, am: x.am, la: x.la, lr: x.lr, msgs: d ? d.msgs : 0,
-        v1: !!x.v1, parts, t: { ...x.t } });
+        v1: !!x.v1, parts, t: { ...x.t }, h: { ...x.h } });
     }
     daily30Models.push(...Object.entries(partsAll).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k]) => k));
     for (const row of daily30) {
@@ -589,8 +609,29 @@ function insights(full, list, anchorDate, tot = {}) {
     // 按目前的速度到窗口结束：开窗不到 20 分钟不外推（样本太少，会报出吓人的数）
     const proj = elapsed >= 20 * 60e3 ? r2(c.usd * (first.e - first.s) / elapsed) : null;
     window = { start: first.s, end: first.e, last, n, out, usd: r2(c.usd), unpriced: c.unpriced, projUsd: proj,
-      usdS: usdS(r2(c.usd)), projS: proj == null ? '' : usdS(proj) };
+      usdS: usdS(r2(c.usd)), projS: proj == null ? '' : usdS(proj), models: winModels(m) };
   }
+
+  // 窗口历史(近 14 天):各设备的窗口并起来,时间上重叠的合成一个(5 小时额度按账号算,不按设备)
+  const winHist = [];
+  {
+    const all = list.flatMap((s) => s.windows || []).filter((x) => x && x.e > x.s).sort((a, b) => a.s - b.s);
+    for (const x of all) {
+      const g = winHist[winHist.length - 1];
+      if (g && x.s < g.e) {
+        g.l = Math.max(g.l, x.l); g.n += x.n;
+        for (const [k, v] of Object.entries(x.m || {})) {
+          const b = g.m[k] || (g.m[k] = { in: 0, out: 0, c5: 0, c1: 0, rd: 0, n: 0 });
+          for (const f of ['in', 'out', 'c5', 'c1', 'rd', 'n']) b[f] += v[f] || 0;
+        }
+      } else winHist.push({ s: x.s, e: x.e, l: x.l, n: x.n, m: JSON.parse(JSON.stringify(x.m || {})) });
+    }
+  }
+  const windows = winHist.reverse().slice(0, 60).map((g) => {
+    const c = costOfModels(g.m);
+    const out = Object.values(g.m).reduce((a, v) => a + (v.out || 0), 0);
+    return { s: g.s, e: g.e, l: g.l, n: g.n, out, usd: r2(c.usd), usdS: usdS(r2(c.usd)), live: g.e > now ? 1 : 0, models: winModels(g.m) };
+  });
 
   // 会话活跃时长：各设备加权平均 / 取最长
   let sn = 0, ssum = 0, smax = 0;
@@ -605,7 +646,16 @@ function insights(full, list, anchorDate, tot = {}) {
   // 排序与占比都按**输出** token —— 与整页的主指标同一个量；按总量（含缓存读取）排，
   // 右边显示的输出数会和排序对不上（缓存读取常是输出的数百倍，完全淹没差异）
   const projects = list.flatMap((s) => s.projects || []).sort((a, b) => b.out - a.out).slice(0, 10)
-    .map((p) => ({ id: p.id, name: p.name || null, out: p.out, tok: p.tok, n: p.n, d7out: p.d7out }));
+    .map((p) => {
+      // 0.6.0 起:与 daily30 对齐的 30 天逐日输出、近 30 天合计与前 30 天比、按模型输出。老插件没有 → has30 = false
+      const has30 = !!(p.days && Object.keys(p.days).length) || (p.p30 || 0) > 0;
+      const d30 = daily30.map((r) => (p.days && p.days[r.d]) || 0);
+      const out30 = d30.reduce((a, b) => a + b, 0);
+      const pm = Object.entries(p.m || {}).map(([k, v]) => [baseModel(k), v]).reduce((o, [k, v]) => ((o[k] = (o[k] || 0) + v), o), {});
+      return { id: p.id, name: p.name || null, out: p.out, tok: p.tok, n: p.n, d7out: p.d7out,
+        has30, d30, out30, p30: p.p30 || 0, chg30: chg(out30, p.p30 || 0),
+        models: Object.entries(pm).sort((a, b) => b[1] - a[1]).map(([name, out]) => ({ name, out })) };
+    });
   const projOut = projects.reduce((a, p) => a + p.out, 0);
   for (const p of projects) p.pct = pct(p.out, projOut);
 
@@ -620,7 +670,7 @@ function insights(full, list, anchorDate, tot = {}) {
     tools, composition, compositionPrev, punch, punchMax, sessions, projects, daily30, daily30Models, deltas }) : null;
 
   return { periods, months, best, costModels, tools, composition, compositionPrev, punch, punchMax, window, sessions,
-    projects, daily30, daily30Models, costBars, deltas, w };
+    projects, daily30, daily30Models, costBars, deltas, w, windows };
 }
 
 /* ─────────────── 组件视图 w（2026-09-24 组件扩充） ───────────────

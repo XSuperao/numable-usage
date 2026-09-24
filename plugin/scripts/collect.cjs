@@ -399,6 +399,8 @@ function absorb(days, o, st, ext) {
     if (pid) {
       const p = day.proj[pid] || (day.proj[pid] = { out: 0, tok: 0, n: 0 });
       p.out += oo; p.tok += oi + oo + ocr + ord; p.n++;
+      // 0.6.0 起:项目按模型的输出(项目详情页的模型分布)。快速模式并回同一模型 —— 看的是「谁在干活」
+      if (base) { p.m = p.m || {}; p.m[base] = (p.m[base] || 0) + oo; }
     }
   }
   return true;
@@ -476,6 +478,38 @@ async function scan(history, root = PROJECTS) {
   }
   flushAct();
   return touched;
+}
+
+// ---------- 5 小时窗口 ----------
+const WIN_KEEP_MS = 14 * 864e5;                      // 窗口历史留 14 天(窗口详情页)
+/**
+ * 由近 12 小时的回复事件算窗口,并按开始时刻合并进 history.win(本机历史)。
+ * ⚠️ 事件只留 12 小时,过期的窗口没法重算 —— 所以每次采集都把算出来的窗口存下来。
+ * ⚠️ 已经存过的窗口是「锚」:事件落在某个已存窗口里,就归那个窗口,不从这条事件的整点重新开窗
+ *    (否则最早那条留存事件在旧窗口中间时,后面整条窗口链都会错位)。
+ * ⚠️ 只有开始时刻还在事件留存期内的窗口才用重算值覆盖 —— 更早的那些事件已经裁掉了一部分,重算会少算。
+ * 返回按开始时刻排好的窗口列表。
+ */
+function foldWindows(history, now = Date.now()) {
+  const win = history.win && typeof history.win === 'object' ? history.win : (history.win = {});
+  const known = Object.values(win).filter((w) => w && w.e > w.s).sort((a, b) => a.s - b.s);
+  const ev = (history.events || []).filter(Array.isArray).sort((a, b) => a[0] - b[0]);
+  const fresh = {};
+  let cur = null;
+  for (const [ts, name, i, o, c5, c1, rd] of ev) {
+    if (!cur || ts >= cur.e) {
+      const hit = known.find((w) => ts >= w.s && ts < w.e);
+      const s0 = hit ? hit.s : Math.floor(ts / 3600e3) * 3600e3;
+      cur = fresh[s0] || (fresh[s0] = { s: s0, e: s0 + 5 * 3600e3, l: ts, n: 0, m: {} });
+    }
+    const b = cur.m[name] || (cur.m[name] = { in: 0, out: 0, c5: 0, c1: 0, rd: 0, n: 0 });
+    b.in += i; b.out += o; b.c5 += c5; b.c1 += c1; b.rd += rd; b.n++;
+    cur.n++; cur.l = Math.max(cur.l, ts);
+  }
+  const retainFrom = now - EVENT_KEEP_MS;
+  for (const w of Object.values(fresh)) if (w.s >= retainFrom || !win[w.s]) win[w.s] = w;
+  for (const k of Object.keys(win)) if (!(win[k] && win[k].s >= now - WIN_KEEP_MS)) delete win[k];
+  return Object.values(win).sort((a, b) => a.s - b.s);
 }
 
 // ---------- 滚动裁剪 ----------
@@ -583,21 +617,11 @@ function buildPayload(history, device, opts = {}) {
 
   // 5 小时窗口：与社区 ccusage 同法 —— 窗口从一次往来所在的整点起算、持续 5 小时，
   // 窗口结束后的第一次往来开下一个窗口。只能算「用了多少」，官方的剩余额度拿不到。
-  let window = null;
-  {
-    const ev = (history.events || []).filter(Array.isArray).sort((a, b) => a[0] - b[0]);
-    let cur = null;
-    for (const [ts, name, i, o, c5, c1, rd] of ev) {
-      if (!cur || ts >= cur.e) {
-        const s0 = Math.floor(ts / 3600e3) * 3600e3;
-        cur = { s: s0, e: s0 + 5 * 3600e3, l: ts, n: 0, m: {} };
-      }
-      const b = cur.m[name] || (cur.m[name] = { in: 0, out: 0, c5: 0, c1: 0, rd: 0, n: 0 });
-      b.in += i; b.out += o; b.c5 += c5; b.c1 += c1; b.rd += rd; b.n++;
-      cur.n++; cur.l = ts;
-    }
-    if (cur && cur.e > Date.now()) window = cur;
-  }
+  // 当前窗口与窗口历史(0.6.0 起,近 14 天)出自同一份 foldWindows,不会两边对不上
+  const allWin = foldWindows(history);
+  const last = allWin[allWin.length - 1];
+  const window = last && last.e > Date.now() ? last : null;
+  const windows = allWin.slice(-60).reverse();
 
   // 会话的活跃时长（近 30 天有动静的会话）
   const sessStats = { n: 0, avgMin: 0, maxMin: 0 };
@@ -616,12 +640,17 @@ function buildPayload(history, device, opts = {}) {
   const projects = [];
   {
     const agg = {};
-    const d7 = dayStr(6);
+    const d7 = dayStr(6), d30 = dayStr(29), d60 = dayStr(59);
     for (const [date, d] of Object.entries(history.days)) {
       for (const [id, v] of Object.entries(d.proj || {})) {
-        const a = agg[id] || (agg[id] = { id, out: 0, tok: 0, n: 0, d7out: 0, d7tok: 0 });
+        const a = agg[id] || (agg[id] = { id, out: 0, tok: 0, n: 0, d7out: 0, d7tok: 0, days: {}, p30: 0, m: {} });
         a.out += v.out | 0; a.tok += v.tok || 0; a.n += v.n | 0;
         if (date >= d7) { a.d7out += v.out | 0; a.d7tok += v.tok || 0; }
+        // 0.6.0 起:近 30 天逐日输出、前 30 天合计、近 30 天按模型(项目详情页)
+        if (date >= d30) {
+          if (v.out) a.days[date] = (a.days[date] || 0) + (v.out | 0);
+          for (const [mn, mo] of Object.entries(v.m || {})) a.m[mn] = (a.m[mn] || 0) + (mo | 0);
+        } else if (date >= d60) a.p30 += v.out | 0;
       }
     }
     for (const a of Object.values(agg).sort((x, y) => y.tok - x.tok).slice(0, 12)) {
@@ -639,6 +668,7 @@ function buildPayload(history, device, opts = {}) {
       byModel,
       hours,
       window,
+      windows,
       sessStats,
       projects,
       totals: { sessions: allSess.size, msgs: tMsgs, out: tOut, in: tIn, cacheCreate: tCr,
@@ -910,6 +940,7 @@ async function collectAndPush({ force = false } = {}) {
 
   const history = loadHistory();
   const touched = await scan(history);
+  foldWindows(history);                              // 必须在 prune 之前:prune 会裁掉 12 小时前的事件
   prune(history);
   writeJson(HISTORY, history);
   log('scanned files:', touched, 'days:', Object.keys(history.days).length);
@@ -948,4 +979,4 @@ if (require.main === module) {
 }
 
 // 供测试用（hook 直接执行本文件，走上面那条）
-module.exports = { absorb, isHumanPrompt, scan, loadHistory, buildPayload, acquireLock, tryLock, emptyDay, ghostOf, activeMinutes, flushAct, touchSession, countLines };
+module.exports = { absorb, isHumanPrompt, scan, loadHistory, buildPayload, foldWindows, acquireLock, tryLock, emptyDay, ghostOf, activeMinutes, flushAct, touchSession, countLines };

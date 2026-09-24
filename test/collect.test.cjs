@@ -512,8 +512,10 @@ test('5 小时窗口：从整点起算、持续 5 小时；窗口过了就没有
   const w = C.buildPayload(h, 'd').snapshot.window;
   assert.ok(w && w.s === Math.floor((now - 2 * 3600e3) / 3600e3) * 3600e3 && w.e === w.s + 5 * 3600e3);
   assert.equal(w.m['claude-opus-5'].out, 150);
-  h.events = [[now - 7 * 3600e3, 'claude-opus-5', 1, 100, 0, 0, 0]];
-  assert.equal(C.buildPayload(h, 'd').snapshot.window, null);
+  // 用一份新历史:窗口会存进 history.win(0.6.0),同一份历史里前面那个窗口还在
+  const h2 = C.loadHistory('/nonexistent');
+  h2.events = [[now - 7 * 3600e3, 'claude-opus-5', 1, 100, 0, 0, 0]];
+  assert.equal(C.buildPayload(h2, 'd').snapshot.window, null);
 });
 
 test('按项目：默认只有匿名编号，打开开关才带文件夹名；worktree 归回所属项目', () => {
@@ -542,4 +544,42 @@ test('锁：对方刚建出锁文件、还没写进程号时不许抢（空内�
   const old = new Date(Date.now() - 60000);
   fs.utimesSync(lock, old, old);
   assert.equal(C.tryLock(lock), true);
+});
+
+test('窗口历史:事件裁掉后已存的窗口还在;最早的留存事件落在旧窗口中间时不重新开窗', () => {
+  const now = Date.now();
+  const H = 3600e3;
+  const h = C.loadHistory('/nonexistent');
+  const s0 = Math.floor((now - 11 * H) / H) * H;             // 11 小时前那个整点开的窗口
+  h.events = [[s0 + 10e3, 'claude-opus-5', 1, 100, 0, 0, 0], [s0 + 4 * H, 'claude-opus-5', 1, 40, 0, 0, 0]];
+  C.foldWindows(h, now);
+  assert.equal(h.win[s0].m['claude-opus-5'].out, 140);
+  // 过了几小时:开头那条事件已经裁掉,只剩窗口中间那条 —— 它必须仍归 s0,不能从它的整点另开一个窗口
+  h.events = [[s0 + 4 * H, 'claude-opus-5', 1, 40, 0, 0, 0], [now - 60e3, 'claude-opus-5', 1, 7, 0, 0, 0]];
+  const list = C.foldWindows(h, now + 2 * H);
+  assert.equal(h.win[s0].m['claude-opus-5'].out, 140, '旧窗口的开头已不在留存期:保留已存的完整值,不被部分重算覆盖');
+  assert.ok(!Object.keys(h.win).some((k) => Number(k) === Math.floor((s0 + 4 * H) / H) * H), '没有错位出来的窗口');
+  assert.equal(list[list.length - 1].m['claude-opus-5'].out, 7);
+  // 14 天前的窗口清掉;快照带 windows(新的在前)
+  h.win[1] = { s: 1, e: 1 + 5 * H, l: 1, n: 1, m: {} };
+  C.foldWindows(h, now);
+  assert.ok(!h.win[1]);
+  const snap = C.buildPayload(h, 'd').snapshot;
+  assert.ok(Array.isArray(snap.windows) && snap.windows.length >= 2 && snap.windows[0].s > snap.windows[1].s);
+});
+
+test('项目:近 30 天逐日输出、前 30 天合计、按模型', () => {
+  const ymd = (off) => { const t = new Date(); t.setDate(t.getDate() - off); return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`; };
+  const h = C.loadHistory('/nonexistent');
+  const pid = 'abcdef1234';
+  h.days = {
+    [ymd(0)]: { ...C.emptyDay(), proj: { [pid]: { out: 30, tok: 90, n: 2, m: { 'claude-opus-5': 20, 'claude-sonnet-5': 10 } } } },
+    [ymd(3)]: { ...C.emptyDay(), proj: { [pid]: { out: 5, tok: 9, n: 1 } } },
+    [ymd(40)]: { ...C.emptyDay(), proj: { [pid]: { out: 100, tok: 300, n: 4 } } },
+  };
+  const p = C.buildPayload(h, 'd').snapshot.projects[0];
+  assert.deepEqual(p.days, { [ymd(0)]: 30, [ymd(3)]: 5 });
+  assert.equal(p.p30, 100);
+  assert.deepEqual(p.m, { 'claude-opus-5': 20, 'claude-sonnet-5': 10 });
+  assert.equal(p.out, 135);
 });

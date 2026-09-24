@@ -1,7 +1,7 @@
 {
   "name": "numable-usage",
   "displayName": "Numable · Claude Code 用量小组件",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "把你的 Claude Code 用量做成手机与桌面小组件。只上传聚合数字，代码与对话永不离开本机。",
   "author": { "name": "Numable", "url": "https://numable.app" }
 }
