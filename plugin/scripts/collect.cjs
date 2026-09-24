@@ -6,9 +6,18 @@
  * 再把全量快照推送到 usage.numable.app。
  *
  * 隐私硬承诺（可审计 —— 见 buildPayload 的显式白名单构造）：
- *   读取的字段只有 type / timestamp / sessionId / isSidechain / message.model / message.usage.*
- *   cwd、gitBranch、message.content、toolUseResult 一律不读取、不落盘、不上报。
+ *   读取的字段只有 type / timestamp / sessionId / isSidechain / isMeta / origin.kind /
+ *   message.id / requestId / message.model / message.usage.*；
+ *   另外 user 行的 message.content 只看两样东西来判断「这是不是你本人发的」（见 isHumanPrompt）：
+ *   数组里各项的 type（有没有 tool_result）、正文开头是不是系统注入的固定标签。判断完即丢弃。
+ *   cwd、gitBranch、对话正文、toolUseResult 一律不落盘、不上报。
  *   上报体里唯一的字符串是「模型名」与「日期」。主机名只以 hash 形式出现。
+ *
+ * 计数口径（2026-09-24 修正，history v2）：
+ *   - token：按 API 响应计。Claude Code 把一次回复的每个内容块各写一行，且每行带着同一份
+ *     usage —— 必须按 message.id + requestId 去重，否则 token 虚高 2~3 倍。
+ *   - 消息：真人发言 + Claude 回复（同样按响应去重），不含工具返回结果与系统注入。
+ *   - 活跃时段：只看真人发言。工具返回结果的 type 也是 user，占 user 行九成。
  *
  * 失败姿态：任何异常都必须静默吞掉 —— 这是挂在 SessionEnd 上的 hook，
  * 打断用户的 Claude Code 会话是最不可接受的失败。
@@ -30,6 +39,7 @@ const HISTORY = path.join(STATE_DIR, 'history.json');
 
 const ENDPOINT = process.env.NUMABLE_USAGE_ENDPOINT || 'https://usage.numable.app';
 const KEEP_DAYS = 90;
+const POST_TIMEOUT_MS = 8000;
 const DEBUG = !!process.env.NUMABLE_USAGE_DEBUG;
 const ALL_MODELS = process.env.NUMABLE_USAGE_MODELS === 'all';
 
@@ -39,7 +49,9 @@ const log = (...a) => { if (DEBUG) console.error('[numable-usage]', ...a); };
 const readJson = (p, fb) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fb; } };
 const writeJson = (p, v) => {
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  const tmp = p + '.tmp';
+  // 临时文件名带 pid：多个会话同时触发 hook 时，共用一个 .tmp 会交错写出坏 JSON，
+  // 坏了 loadHistory 只能退回空历史 —— 已被 Claude Code 清理掉的会话记录就永久丢了。
+  const tmp = `${p}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(v));
   fs.renameSync(tmp, p);                     // 原子替换，防写一半被打断
 };
@@ -53,12 +65,60 @@ const normModel = (m) => {
   return m.startsWith('claude-') ? m : 'other';
 };
 
-// ---------- 空历史 ----------
-const emptyDay = () => ({ msgs: 0, sess: [], out: 0, in: 0, cr: 0, rd: 0, tools: 0, hours: {}, byModel: {} });
+// ---------- 进程锁 ----------
+// SessionStart / SessionEnd 在多个会话里会同时触发。读-改-写 history 必须串行，
+// 否则后写的覆盖先写的（白扫一遍）、首次接入还会各建一个空间。
+const LOCK = path.join(STATE_DIR, 'lock');
+const LOCK_WAIT_MS = 20000;               // > 一次推送超时，排在后面的会话等得到
+const LOCK_STALE_MS = 10 * 60 * 1000;
 
-function loadHistory() {
-  const h = readJson(HISTORY, null);
-  if (!h || h.v !== 1 || typeof h.days !== 'object') return { v: 1, files: {}, days: {} };
+const pidAlive = (pid) => {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+};
+
+function tryLock(lockPath) {
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx');
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      return true;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+    }
+    // 持锁进程已经不在了（被杀 / 崩溃）或锁太旧 → 清掉再试一次
+    let stale;
+    try {
+      const pid = parseInt(fs.readFileSync(lockPath, 'utf8'), 10);
+      const age = Date.now() - fs.statSync(lockPath).mtimeMs;
+      stale = !pidAlive(pid) || age > LOCK_STALE_MS;
+    } catch { stale = true; }                // 读不到 = 对方刚释放
+    if (!stale) return false;
+    try { fs.unlinkSync(lockPath); } catch { /* 别人先清了 */ }
+  }
+  return false;
+}
+
+async function acquireLock(lockPath = LOCK, waitMs = LOCK_WAIT_MS) {
+  const until = Date.now() + waitMs;
+  for (;;) {
+    if (tryLock(lockPath)) return () => { try { fs.unlinkSync(lockPath); } catch { /* 已被清 */ } };
+    if (Date.now() >= until) return null;
+    await new Promise((r) => setTimeout(r, 150));
+  }
+}
+
+// ---------- 空历史 ----------
+// v2 = 2026-09-24 口径修正（token 按响应去重 / 消息不含工具结果）。
+// v1 的数字虚高，不与 v2 混用：读到 v1 直接丢弃，从本机会话记录全量重算。
+const HISTORY_V = 2;
+const emptyDay = () => ({ msgs: 0, sess: [], out: 0, in: 0, cr: 0, rd: 0, hours: {}, byModel: {} });
+
+function loadHistory(p = HISTORY) {
+  const h = readJson(p, null);
+  if (!h || h.v !== HISTORY_V || !h.days || typeof h.days !== 'object') return { v: HISTORY_V, files: {}, days: {} };
   if (!h.files || typeof h.files !== 'object') h.files = {};
   return h;
 }
@@ -78,8 +138,53 @@ function listJsonl(root) {
   return out;
 }
 
-/** 把一行的数字并进 history。返回是否计入。 */
-function absorb(days, o) {
+/**
+ * 系统以 user 身份写进会话的行，正文开头是这些固定标签。
+ * 只在没有 origin.kind 时才靠它判断（纯 CLI 的日志不带 origin）。
+ */
+const MACHINE_PREFIXES = [
+  '<local-command-stdout>', '<local-command-stderr>', '<local-command-caveat>',
+  '<bash-stdout>', '<bash-stderr>', '<task-notification>', '<system-reminder>',
+  '<scheduled-task', '[Request interrupted',
+];
+
+/** 这一行 user 是不是你本人发的（含斜杠命令、贴图）。工具返回结果、系统注入都不算。 */
+function isHumanPrompt(o) {
+  if (o.isMeta || o.isCompactSummary || o.isVisibleInTranscriptOnly) return false;
+  const c = o.message && o.message.content;
+  let head;
+  if (typeof c === 'string') head = c;
+  else if (Array.isArray(c)) {
+    if (c.some((x) => x && x.type === 'tool_result')) return false;
+    const t = c.find((x) => x && x.type === 'text');
+    head = t && typeof t.text === 'string' ? t.text : (c.length ? null : '');
+  } else return false;
+  // 新版（SDK / 桌面端）明确标了来源，以它为准
+  const kind = o.origin && typeof o.origin === 'object' ? o.origin.kind : undefined;
+  if (typeof kind === 'string') return kind === 'human';
+  if (head === null) return true;            // 只有图片没有文字 = 你贴的图
+  head = head.trimStart().slice(0, 32);
+  if (!head) return false;
+  return !MACHINE_PREFIXES.some((p) => head.startsWith(p));
+}
+
+/** 同一次 API 响应的去重键。拿不到 id 就不去重（宁可少去重，不可错合并）。 */
+const responseKey = (o) => {
+  const id = o.message && typeof o.message.id === 'string' ? o.message.id : '';
+  if (!id) return null;
+  return crypto.createHash('sha1').update(id + '|' + (typeof o.requestId === 'string' ? o.requestId : ''))
+    .digest('hex').slice(0, 12);
+};
+
+/**
+ * 同一响应的各行在同一个文件里、彼此相隔几行之内（实测 993 个文件跨文件重复 0 条）。
+ * 所以只需每个文件记住最近 RECENT_KEYS 个响应键，不必维护全局集合。
+ */
+const RECENT_KEYS = 32;
+const remember = (recent, k) => { recent.push(k); if (recent.length > RECENT_KEYS) recent.shift(); };
+
+/** 把一行的数字并进 history。recent = 本文件最近的响应键（会被修改）。返回是否计入。 */
+function absorb(days, o, recent) {
   const t = o.type;
   if (t !== 'user' && t !== 'assistant') return false;
   const ts = o.timestamp ? Date.parse(o.timestamp) : NaN;
@@ -89,19 +194,30 @@ function absorb(days, o) {
   const day = days[date] || (days[date] = emptyDay());
   const side = !!o.isSidechain;
 
-  // Messages / Sessions / Peak hour：排除 sidechain（subagent 内部往返不是「你的对话」）
-  if (!side) {
-    day.msgs++;
-    if (typeof o.sessionId === 'string' && !day.sess.includes(o.sessionId)) day.sess.push(o.sessionId);
-    if (t === 'user') {
+  // Sessions：排除 sidechain（subagent 内部往返不是「你的对话」）
+  if (!side && typeof o.sessionId === 'string' && !day.sess.includes(o.sessionId)) day.sess.push(o.sessionId);
+
+  if (t === 'user') {
+    // Messages / Peak hour：只数你本人发的，排除 sidechain
+    if (!side && isHumanPrompt(o)) {
+      day.msgs++;
       const h = String(new Date(ts).getHours());
       day.hours[h] = (day.hours[h] || 0) + 1;
     }
+    return true;
   }
+
+  // assistant：同一响应只计一次
+  const k = responseKey(o);
+  if (k) {
+    if (recent.includes(k)) return true;
+    remember(recent, k);
+  }
+  if (!side) day.msgs++;
 
   // Tokens：含 sidechain（subagent 也在真实消耗）
   const m = o.message;
-  if (t === 'assistant' && m && typeof m === 'object' && m.usage && typeof m.usage === 'object') {
+  if (m && typeof m === 'object' && m.usage && typeof m.usage === 'object') {
     const u = m.usage;
     const n = (x) => (typeof x === 'number' && Number.isFinite(x) ? x : 0);
     const oi = n(u.input_tokens), oo = n(u.output_tokens);
@@ -116,51 +232,70 @@ function absorb(days, o) {
   return true;
 }
 
-async function scan(history) {
-  if (!fs.existsSync(PROJECTS)) { log('no projects dir'); return 0; }
-  const files = listJsonl(PROJECTS);
+/** 文件 [from, size) 区间里最后一个换行符之后的位置；区间里没有换行返回 from。 */
+function lastLineEnd(f, from, size) {
+  const CHUNK = 65536;
+  let fd;
+  try {
+    fd = fs.openSync(f, 'r');
+    const buf = Buffer.alloc(CHUNK);
+    for (let end = size; end > from;) {
+      const start = Math.max(from, end - CHUNK);
+      const len = end - start;
+      fs.readSync(fd, buf, 0, len, start);
+      const idx = buf.subarray(0, len).lastIndexOf(0x0a);
+      if (idx >= 0) return start + idx + 1;
+      end = start;
+    }
+    return from;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+// 超过这个时长没动过的文件不会再续写同一个响应，不必留去重键（history 保持小）
+const RECENT_TTL_MS = 2 * 864e5;
+
+async function scan(history, root = PROJECTS) {
+  if (!fs.existsSync(root)) { log('no projects dir'); return 0; }
+  const files = listJsonl(root);
   let touched = 0;
 
   for (const f of files) {
     let st; try { st = fs.statSync(f); } catch { continue; }
     const prev = history.files[f];
     let from = 0;
-    if (prev && typeof prev.off === 'number') {
-      if (st.size === prev.off) continue;                 // 没长，跳过
-      if (st.size > prev.off) from = prev.off;            // append，只读新增
-      // st.size < prev.off → 文件被重写，from 保持 0 全读
-      if (st.size < prev.off) { log('rewound, rescan:', path.basename(f)); }
+    let recent = [];
+    if (prev && typeof prev.off === 'number' && typeof prev.size === 'number') {
+      if (st.size === prev.size) continue;                // 没变，跳过
+      if (st.size > prev.size) {                          // append，从上次最后一个完整行之后续读
+        from = prev.off;
+        if (Array.isArray(prev.recent)) recent = prev.recent.slice(-RECENT_KEYS);
+      } else log('rewound, rescan:', path.basename(f));    // 被重写，从头读
     }
 
-    await new Promise((resolve) => {
-      const rs = fs.createReadStream(f, { start: from, encoding: 'utf8' });
-      const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
-      let first = true;
-      rl.on('line', (line) => {
-        // 从 offset 续读时首行可能是半行（上次写到一半）—— JSON.parse 会失败并被丢弃，
-        // 这是可接受的：下一轮该行已完整，但 offset 已越过它。故 offset 只在整行边界推进（见下）。
-        if (!line) { first = false; return; }
-        try { absorb(history.days, JSON.parse(line)); } catch { /* 半行或坏行，丢弃 */ }
-        first = false;
+    // 只读到「最后一个完整行」为止：之后的半行等它写完下一轮再读。
+    // 边界必须在读之前定死 —— 读的过程中文件还在被别的会话追加，
+    // 不设 end 就会读进 stat 之后的行，而 offset 又停在它们之前 → 下一轮重复计入。
+    let off;
+    try { off = lastLineEnd(f, from, st.size); } catch { continue; }
+
+    if (off > from) {
+      await new Promise((resolve) => {
+        const rs = fs.createReadStream(f, { start: from, end: off - 1, encoding: 'utf8' });
+        const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+        rl.on('line', (line) => {
+          if (!line) return;
+          try { absorb(history.days, JSON.parse(line), recent); } catch { /* 坏行，丢弃 */ }
+        });
+        rl.on('close', resolve);
+        rs.on('error', () => resolve());
       });
-      rl.on('close', resolve);
-      rs.on('error', () => resolve());
-    });
+    }
 
-    // offset 推进到「最后一个换行符」处，保证下次从整行开始，不会重复计入也不会腰斩。
-    let off = st.size;
-    try {
-      const fd = fs.openSync(f, 'r');
-      const tailLen = Math.min(65536, st.size);
-      const buf = Buffer.alloc(tailLen);
-      fs.readSync(fd, buf, 0, tailLen, st.size - tailLen);
-      fs.closeSync(fd);
-      const idx = buf.lastIndexOf(0x0a);
-      if (idx >= 0) off = st.size - tailLen + idx + 1;
-      else if (from > 0) off = from;                       // 整段无换行，不推进
-    } catch { /* 拿不到就用 size */ }
-
-    history.files[f] = { off, size: st.size };
+    const entry = { off, size: st.size };
+    if (recent.length && Date.now() - st.mtimeMs < RECENT_TTL_MS) entry.recent = recent;
+    history.files[f] = entry;
     touched++;
   }
   return touched;
@@ -241,7 +376,10 @@ function buildPayload(history, device) {
 async function post(pathname, body, token) {
   const headers = { 'content-type': 'application/json' };
   if (token) headers.authorization = `Bearer ${token}`;
-  const res = await fetch(ENDPOINT + pathname, { method: 'POST', headers, body: JSON.stringify(body || {}) });
+  // 必须有超时：服务端挂住时 hook 会一直卡着，而且期间一直持锁
+  const res = await fetch(ENDPOINT + pathname, {
+    method: 'POST', headers, body: JSON.stringify(body || {}), signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+  });
   const text = await res.text();
   let json = null; try { json = JSON.parse(text); } catch { /* 非 JSON */ }
   return { ok: res.ok, status: res.status, json, text };
@@ -300,6 +438,18 @@ async function main() {
   if (arg === '--code') return cmdCode();
   if (arg === '--token') return cmdToken();
 
+  // 读-改-写 config / history 全程持锁；拿不到（别的会话正在采集）就放弃这一轮 ——
+  // 它会顺带把本会话已写下的行也扫进去，漏掉的尾巴下一次 hook 触发时补上。
+  const release = await acquireLock();
+  if (!release) { log('another collector is running, skip'); return; }
+  try {
+    await collectAndPush();
+  } finally {
+    release();
+  }
+}
+
+async function collectAndPush() {
   let cfg = readJson(CONFIG, null);
 
   if (!cfg || !cfg.spaceId || !cfg.writeToken) {
@@ -350,4 +500,9 @@ function printOnboarding(code, out) {
 ${line}\n`);
 }
 
-main().catch((e) => { log('fatal (swallowed)', e && e.message); });
+if (require.main === module) {
+  main().catch((e) => { log('fatal (swallowed)', e && e.message); });
+}
+
+// 供测试用（hook 直接执行本文件，走上面那条）
+module.exports = { absorb, isHumanPrompt, scan, loadHistory, buildPayload, acquireLock, tryLock, emptyDay };

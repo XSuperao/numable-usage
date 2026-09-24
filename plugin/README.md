@@ -39,6 +39,20 @@
 这不是承诺而是结构：`scripts/collect.cjs` 的 `buildPayload()` 是**显式白名单构造**，
 服务端 `sanitizeClaudeCode()` 再做一次白名单过滤 —— 没列出来的字段两道都过不去。
 
+## 它读什么、怎么数
+
+采集脚本逐行读本机的 `~/.claude/projects/**/*.jsonl`，只取计数需要的字段：
+`type`、`timestamp`、`sessionId`、`isSidechain`、`isMeta`、`origin.kind`、`message.id`、`requestId`、
+`message.model`、`message.usage`。对话正文**只看一眼**：user 行里有没有工具返回结果、
+开头是不是系统注入的固定标签（如 `<local-command-stdout>`）—— 用来判断这句是不是你本人说的，判断完即丢弃。
+
+| 指标 | 口径 |
+|---|---|
+| token | 按 API 响应计。Claude Code 把一次回复的每个内容块各写一行、每行带同一份用量，按 `message.id` + `requestId` 去重；含 subagent |
+| 消息 | 你发的话 + Claude 的回复（同样按响应去重），不含工具返回结果、系统注入、subagent 内部往返 |
+| 活跃时段 | 只看你发的话 |
+| 会话 | 有过对话的 `sessionId` 个数，不含 subagent |
+
 ## 数据在哪
 
 - **本机**：`~/.claude/numable-usage/history.json` —— 这是真相，服务端只是投递管道。
