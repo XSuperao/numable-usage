@@ -13,6 +13,13 @@
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/collect.cjs\"" }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/collect.cjs\" --tick" }
+        ]
+      }
     ]
   }
 }

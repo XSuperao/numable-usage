@@ -41,6 +41,8 @@ const HISTORY = path.join(STATE_DIR, 'history.json');
 const ENDPOINT = process.env.NUMABLE_USAGE_ENDPOINT || 'https://usage.numable.app';
 const KEEP_DAYS = 90;
 const POST_TIMEOUT_MS = 8000;
+// 会话进行中（Stop 钩子）最多每 10 分钟推一次：「今日」组件在长会话里也能跟着动
+const TICK_MS = 10 * 60 * 1000;
 const DEBUG = !!process.env.NUMABLE_USAGE_DEBUG;
 const ALL_MODELS = process.env.NUMABLE_USAGE_MODELS === 'all';
 
@@ -208,6 +210,10 @@ function absorb(days, o, recent) {
     return true;
   }
 
+  // Claude Code 在 API 报错 / 中断时写一条 model=<synthetic> 的占位回复，usage 全 0 ——
+  // 不是模型真的回了话，不计消息、不进模型分布
+  if (o.message && o.message.model === '<synthetic>') return true;
+
   // assistant：同一响应只计一次
   const k = responseKey(o);
   if (k) {
@@ -341,7 +347,8 @@ function buildPayload(history, device) {
   const days = [];
   const byModel = {};
   const hours = {};
-  let tSess = 0, tMsgs = 0, tOut = 0, tIn = 0, tCr = 0;
+  let tMsgs = 0, tOut = 0, tIn = 0, tCr = 0;
+  const allSess = new Set();          // 跨午夜的会话在两天里各出现一次，总数按 id 去重
 
   for (const date of Object.keys(history.days).sort()) {
     const d = history.days[date];
@@ -354,7 +361,8 @@ function buildPayload(history, device) {
       in: d.in | 0,
       cacheCreate: d.cr | 0,
     });
-    tSess += sessions; tMsgs += d.msgs | 0; tOut += d.out | 0; tIn += d.in | 0; tCr += d.cr | 0;
+    if (Array.isArray(d.sess)) for (const id of d.sess) allSess.add(id);
+    tMsgs += d.msgs | 0; tOut += d.out | 0; tIn += d.in | 0; tCr += d.cr | 0;
     for (const [m, v] of Object.entries(d.byModel || {})) {
       const b = byModel[m] || (byModel[m] = { in: 0, out: 0, msgs: 0 });
       b.in += v.in | 0; b.out += v.out | 0; b.msgs += v.msgs | 0;
@@ -392,7 +400,7 @@ function buildPayload(history, device) {
       days,
       byModel,
       hours,
-      totals: { sessions: tSess, msgs: tMsgs, out: tOut, in: tIn, cacheCreate: tCr,
+      totals: { sessions: allSess.size, msgs: tMsgs, out: tOut, in: tIn, cacheCreate: tCr,
                 activeDays: days.length, streak, longestStreak: longest },
     },
   };
@@ -437,6 +445,7 @@ async function cmdStatus() {
   console.log(`会话 ${sess} · 消息 ${fmt(msgs)} · 输出 token ${fmt(out)}`);
   console.log(`服务端 ${cfg.endpoint || ENDPOINT}`);
   console.log('\n把用量接到 Numable：--token 打印读取令牌（粘进 App 的凭证设置）。');
+  console.log('还有别的电脑也在用 Claude Code？--link 生成加入串，让它们合并到同一个空间。');
   console.log('数字比实际偏大？--devices 看看有没有这台电脑改名前留下的旧记录。');
 }
 
@@ -454,13 +463,9 @@ async function cmdToken() {
   console.log('\n它只能读你自己的用量数字，不能写、不能改、不能看别人的。');
 }
 
-async function cmdCode() {
-  const cfg = readJson(CONFIG, null);
-  if (!cfg || !cfg.writeToken) { console.log('尚未接入，先跑一次采集。'); return; }
-  const r = await post('/code', {}, cfg.writeToken);
-  if (!r.ok || !r.json || !r.json.code) { console.log('生成失败:', r.status, r.text.slice(0, 200)); return; }
-  printOnboarding(r.json.code, console.log);
-}
+// 配对码（服务端 /code + /claim）是给「App 里输入 6 位码」预留的，App 目前没有这个入口 ——
+// 打印一个用户用不上的码只会让人卡住，所以 --code 与 --token 走同一条路。
+const cmdCode = () => cmdToken();
 
 async function cmdDevices() {
   const cfg = readJson(CONFIG, null);
@@ -519,6 +524,59 @@ async function cmdForget(id) {
     : `服务端没有设备 ${id}（可能已经删过了）。`);
 }
 
+/** 另一台电脑加入本空间用的一串：空间 id + 两枚令牌（+ 非默认服务端）。 */
+function cmdLink() {
+  const cfg = readJson(CONFIG, null);
+  if (!cfg || !cfg.writeToken || !cfg.readToken) { console.log('尚未接入，先跑一次采集（或在 Claude Code 里开一个新会话）。'); return; }
+  const o = { s: cfg.spaceId, w: cfg.writeToken, r: cfg.readToken };
+  if ((cfg.endpoint || ENDPOINT) !== 'https://usage.numable.app') o.e = cfg.endpoint || ENDPOINT;
+  const code = 'nu1.' + Buffer.from(JSON.stringify(o)).toString('base64url');
+  console.log('在另一台电脑上装好插件后，在那边的 Claude Code 里运行 /numable-usage，说「加入用量空间」并贴上这一串：\n');
+  console.log(code);
+  console.log('\n加入后两台电脑的用量会合并显示在同一组组件里，Numable 里不用再绑第二个令牌。');
+  console.log('⚠ 这一串能往你的空间写数据，只在你自己的电脑之间传，不要发给别人。');
+}
+
+async function cmdJoin(code) {
+  let o = null;
+  try {
+    if (typeof code === 'string' && code.startsWith('nu1.')) o = JSON.parse(Buffer.from(code.slice(4), 'base64url').toString('utf8'));
+  } catch { /* 下面统一报 */ }
+  const tokOk = (t) => typeof t === 'string' && /^[A-Za-z0-9_-]{8,32}\.[A-Za-z0-9_-]{20,}$/.test(t);
+  if (!o || !tokOk(o.w) || !tokOk(o.r) || typeof o.s !== 'string' || !o.w.startsWith(o.s + '.') || !o.r.startsWith(o.s + '.')) {
+    console.log('这一串不对。请在原来那台电脑上运行 /numable-usage 重新生成（--link）。'); return;
+  }
+  const endpoint = typeof o.e === 'string' && /^https?:\/\//.test(o.e) ? o.e : 'https://usage.numable.app';
+  if (endpoint !== ENDPOINT) {
+    console.log(`这一串指向另一个服务端（${endpoint}）。请先设置 NUMABLE_USAGE_ENDPOINT=${endpoint} 再加入。`); return;
+  }
+
+  const release = await acquireLock();
+  if (!release) { console.log('采集正在进行，过几秒再试一次。'); return; }
+  try {
+    const old = readJson(CONFIG, null) || {};
+    if (old.spaceId === o.s) { console.log('这台电脑已经在这个空间里了。'); return; }
+    let r;
+    try { r = await get('/s', o.r); } catch (e) { console.log('连不上服务端：', e && e.message); return; }
+    if (r.status === 401) { console.log('这一串已经失效。请在原来那台电脑上重新生成。'); return; }
+    if (!r.ok) { console.log('加入失败：', r.status, r.text.slice(0, 200)); return; }
+
+    const device = deviceId(old);
+    // 这台电脑原先自己那个空间里的设备行顺手删掉（尽力而为）：不删也会在 90 天无推送后被回收
+    if (old.spaceId && old.writeToken) {
+      try { await post('/forget', { source: 'claude-code', device }, old.writeToken); } catch { /* 忽略 */ }
+    }
+    writeJson(CONFIG, {
+      endpoint, spaceId: o.s, writeToken: o.w, readToken: o.r, device,
+      createdAt: old.createdAt || new Date().toISOString(), joinedAt: new Date().toISOString(),
+    });
+    await collectAndPush({ force: true });
+    console.log('已加入。这台电脑的用量会和原来那台合并显示；Numable 里不用改任何设置，下次刷新就能看到。');
+  } finally {
+    release();
+  }
+}
+
 // ---------- 主流程 ----------
 async function main() {
   const arg = process.argv[2];
@@ -527,7 +585,17 @@ async function main() {
   if (arg === '--token') return cmdToken();
   if (arg === '--devices') return cmdDevices();
   if (arg === '--forget') return cmdForget(process.argv[3]);
+  if (arg === '--link') return cmdLink();
+  if (arg === '--join') return cmdJoin(process.argv[3]);
   if (arg === '--run' || DEBUG) return runCollect();
+
+  // Stop 钩子（每轮回复结束都触发）：离上次起采集不到 TICK_MS 就什么都不做，连后台进程都不起。
+  // 会话开始 / 结束不节流 —— 那两刻的数据最该准。
+  const mark = path.join(STATE_DIR, 'last-spawn');
+  if (arg === '--tick') {
+    try { if (Date.now() - fs.statSync(mark).mtimeMs < TICK_MS) return; } catch { /* 没有标记 = 从没起过 */ }
+  }
+  try { fs.mkdirSync(STATE_DIR, { recursive: true }); fs.writeFileSync(mark, ''); } catch { /* 标记写不了只是少节流 */ }
 
   // hook 入口：把采集甩给一个脱离会话的后台进程，自己立刻退出。
   // 首次（或 history 升级后）全量重扫要十几秒，挂在 SessionStart 上会让会话卡住等它。
@@ -555,7 +623,7 @@ async function runCollect() {
   }
 }
 
-async function collectAndPush() {
+async function collectAndPush({ force = false } = {}) {
   let cfg = readJson(CONFIG, null);
 
   if (!cfg || !cfg.spaceId || !cfg.writeToken) {
@@ -569,7 +637,7 @@ async function collectAndPush() {
       createdAt: new Date().toISOString(),
     };
     writeJson(CONFIG, cfg);
-    printOnboarding(r.json.code);
+    printOnboarding();
   }
 
   const history = loadHistory();
@@ -578,7 +646,7 @@ async function collectAndPush() {
   writeJson(HISTORY, history);
   log('scanned files:', touched, 'days:', Object.keys(history.days).length);
 
-  if (!touched && !process.env.NUMABLE_USAGE_FORCE) { log('nothing changed, skip push'); return; }
+  if (!touched && !force && !process.env.NUMABLE_USAGE_FORCE) { log('nothing changed, skip push'); return; }
 
   // 设备标识第一次算出后钉进 config，之后不再重算。
   // ⚠️ macOS 没设 HostName 时 os.hostname() 随网络变（DHCP / Bonjour 名），
@@ -595,18 +663,14 @@ async function collectAndPush() {
   log('pushed', payload.snapshot.days.length, 'days');
 }
 
-function printOnboarding(code, out) {
-  const w = out || console.error;
+function printOnboarding() {
   const line = '─'.repeat(46);
-  w(`\n${line}
-  Numable · Claude Code 用量小组件已就绪
+  console.error(`\n${line}
+  Numable · Claude Code 用量已开始采集
   ${line}
-  在手机 / 桌面的 Numable 里打开「Claude Code 用量」，
-  输入这个配对码即可看到你的用量卡片：
+  在 Claude Code 里运行 /numable-usage 取出读取令牌，
+  粘贴到 Numable 的「我的 → 凭证」里，就能在手机和桌面组件上看到用量。
 
-        ${code}
-
-  · 5 分钟内有效，可用 /numable-usage 重新生成
   · 只上传聚合数字，你的代码与对话永不离开本机
 ${line}\n`);
 }

@@ -11,7 +11,7 @@
  *   POST /code    Bearer<write>     → { code }
  *   POST /forget  Bearer<write>     { source, device } → { ok, removed }   删掉一个设备行
  *   POST /claim   { code }          → { readToken }
- *   GET  /s       Bearer<read>      → { updatedAt, sources }
+ *   GET  /s       Bearer<read>      → { updatedAt, merged, sources }   ?today=YYYY-MM-DD 以看的人那天为锚
  *   GET  /health
  */
 
@@ -159,8 +159,15 @@ function sanitizeClaudeCode(s) {
 
 const SOURCES = { 'claude-code': sanitizeClaudeCode };   // 枚举，不是自由字段
 
-/** 多设备合并成一份（同一个人的多台机器应该看成一份用量）。 */
-function mergeClaudeCode(list) {
+/**
+ * 多设备合并成一份（同一个人的多台机器应该看成一份用量）。
+ * anchor = 看的人那边的「今天」（YYYY-MM-DD，由取数流带上来）。给了它：
+ *   - today 就是那一天（没用过 = 全 0 的一行），不再拿「数据里最后一天」冒充今天；
+ *   - 热力网格右下角落在那一天；
+ *   - 连续天数按**合并后**的日期集合重算 —— 各设备各算再取最大，两台电脑轮流用就断了。
+ * 不给（老版本的包）：维持原行为。
+ */
+function mergeClaudeCode(list, anchor) {
   const dayMap = new Map(), byModel = {}, hours = {};
   const tot = { sessions: 0, msgs: 0, out: 0, in: 0, cacheCreate: 0, streak: 0, longestStreak: 0 };
   for (const s of list) {
@@ -190,18 +197,45 @@ function mergeClaudeCode(list) {
      未知形态原样回落（宁可长一点，也不要猜错成别的模型名）。 */
   const label = (n) => {
     if (n === 'other') return 'Other';
-    const m = /^claude-(opus|sonnet|haiku|fable)-(\d+)(?:-(\d+))?/.exec(n);
+    // 小版本号只认 1~2 位：`claude-opus-4-20250514` 里那串是发布日期，不是「4.20250514」
+    const m = /^claude-(opus|sonnet|haiku|fable)-(\d+)(?:-(\d{1,2})(?!\d))?/.exec(n);
     if (!m) return n;
     const fam = m[1][0].toUpperCase() + m[1].slice(1);
     return `${fam} ${m[2]}${m[3] ? '.' + m[3] : ''}`;
   };
-  const models = Object.entries(byModel).sort((a, b) => b[1].out - a[1].out).slice(0, 6)
+  const models = Object.entries(byModel).filter(([, v]) => v.out > 0 || v.in > 0).sort((a, b) => b[1].out - a[1].out).slice(0, 6)
     .map(([name, v]) => ({
       name, label: label(name), in: v.in, out: v.out, msgs: v.msgs,
       pct: Math.round((v.out / totOut) * 1000) / 10,
     }));
   const peak = Object.entries(hours).sort((a, b) => b[1] - a[1])[0];
-  const today = days.length ? days[days.length - 1] : null;
+  const lastDate = days.length ? days[days.length - 1].date : '';
+  // 看的人比采集机的时区靠后时，数据里会有「他的明天」—— 那就以数据为准，不往回退
+  const anchorDate = anchor && (!lastDate || anchor >= lastDate) ? anchor : lastDate;
+  const zeroDay = (date) => ({ date, msgs: 0, sessions: 0, out: 0, in: 0, cacheCreate: 0 });
+  const today = anchor
+    ? (dayMap.get(anchorDate) || zeroDay(anchorDate))
+    : (days.length ? days[days.length - 1] : null);
+
+  if (anchor) {
+    const DAY = 864e5;
+    const ms = (d) => Date.parse(d + 'T00:00:00Z');
+    const has = new Set(days.map((d) => d.date));
+    const iso = (t) => new Date(t).toISOString().slice(0, 10);
+    // 今天还没用不算断 —— 从今天或昨天起往回数
+    let cur = has.has(anchorDate) ? ms(anchorDate) : has.has(iso(ms(anchorDate) - DAY)) ? ms(anchorDate) - DAY : NaN;
+    let streak = 0;
+    while (Number.isFinite(cur) && has.has(iso(cur))) { streak++; cur -= DAY; }
+    let longest = 0, run = 0, prev = NaN;
+    for (const d of days) {
+      const t = ms(d.date);
+      run = t - prev === DAY ? run + 1 : 1;
+      longest = Math.max(longest, run);
+      prev = t;
+    }
+    tot.streak = streak;
+    tot.longestStreak = longest;
+  }
 
   /* 热力网格：10 列 × 7 行，列=周、行=星期几，右下角是最后一天。
      ⚠️ 基准取「数据里的最后一天」而不是服务器今天 —— 服务端不知道采集机在哪个时区，
@@ -209,11 +243,11 @@ function mergeClaudeCode(list) {
      ⚠️ 逐格算好 col/row/level 一并下发，RCN 侧只需一层 forEach 取 ${_it.c}/${_it.r}——
      VParser 没有 floor，让渲染层去算 i/7 会算不准（「派生序列优先在数据层预计算」）。*/
   const grid = [];
-  if (days.length) {
+  if (days.length && anchorDate) {
     const DAY = 864e5;
     const parse = (d) => Date.parse(d + 'T00:00:00Z');     // 纯日期按 UTC 解析 = 确定性，不涉时区
     const fmt = (ms) => new Date(ms).toISOString().slice(0, 10);
-    const lastMs = parse(today.date);
+    const lastMs = parse(anchorDate);
     const lastWd = new Date(lastMs).getUTCDay();
     const cells = 63 + lastWd + 1;                          // 恒 10 列，末列到 lastWd 为止
     const startMs = lastMs - (cells - 1) * DAY;
@@ -369,7 +403,10 @@ async function handle(req, env, ctx) {
       (sources[r.source] || (sources[r.source] = [])).push({ device: r.device, updatedAt: r.updated_at, ...pl });
     }
     // 跨设备合并：纯加法，属于数据完整性而非展示逻辑，放服务端做比在 RCN/VParser 里拼简单一个量级。
-    return json({ updatedAt, merged: mergeClaudeCode(sources['claude-code'] || []), sources });
+    // ?today= 只在离服务器时间 3 天以内才认 —— 各时区的「今天」都落在这个窗里，再远就是参数写错了
+    const q = url.searchParams.get('today') || '';
+    const anchor = DATE_RE.test(q) && Math.abs(Date.parse(q + 'T12:00:00Z') - Date.now()) < 3 * 864e5 ? q : '';
+    return json({ updatedAt, merged: mergeClaudeCode(sources['claude-code'] || [], anchor), sources });
   }
 
   return err('not_found', 404);

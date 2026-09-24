@@ -334,3 +334,126 @@ test('--devices 标出分身、--forget 拒删本机并只删点名的那个', a
   assert.match(await cli('--forget', 'bbbbbbbbbbbb'), /已删除设备 bbbbbbbbbbbb/);
   assert.deepEqual(forgets, [{ auth: 'Bearer W', body: { source: 'claude-code', device: 'bbbbbbbbbbbb' } }]);
 });
+
+test('<synthetic> 占位回复不计消息、不进模型分布', () => {
+  const d = run([asst('m1', 'r1', 5), { ...asst('m2', 'r2', 0), message: { id: 'm2', model: '<synthetic>', usage: {} } }]);
+  assert.equal(d.msgs, 1);
+  assert.deepEqual(Object.keys(d.byModel), ['claude-opus-5']);
+});
+
+test('总会话数按 id 去重（跨午夜的会话只算一次）', () => {
+  const days = {
+    '2026-09-01': { ...C.emptyDay(), sess: ['a', 'b'] },
+    '2026-09-02': { ...C.emptyDay(), sess: ['b', 'c'] },
+  };
+  const p = C.buildPayload({ days }, 'd');
+  assert.equal(p.snapshot.totals.sessions, 3);
+  assert.deepEqual(p.snapshot.days.map((d) => d.sessions), [2, 2]);  // 逐日仍是当天的会话数
+});
+
+// 起一个假服务端；handlers 按 "METHOD /path" 分派，返回 [status, body]
+async function fakeServer(t, handlers) {
+  const log = [];
+  const server = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => { b += c; });
+    req.on('end', () => {
+      const key = `${req.method} ${req.url}`;
+      const entry = { key, auth: req.headers.authorization, body: b ? JSON.parse(b) : null };
+      log.push(entry);
+      const h = handlers[key];
+      const [st, body] = h ? h(entry) : [404, {}];
+      res.statusCode = st;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify(body));
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  return { log, endpoint: `http://127.0.0.1:${server.address().port}` };
+}
+const cliWith = (env) => (...args) => new Promise((resolve) => {
+  const p = spawn(process.execPath, [SCRIPT, ...args], { env });
+  let out = '';
+  p.stdout.on('data', (c) => { out += c; });
+  p.stderr.resume();
+  p.on('close', () => resolve(out));
+});
+const waitFor = async (fn, ms = 15000) => {
+  const until = Date.now() + ms;
+  while (!fn() && Date.now() < until) await new Promise((r) => setTimeout(r, 100));
+};
+
+test('Stop 钩子节流：10 分钟内只起一次采集；会话开始/结束不节流', async (t) => {
+  const home = tmp();
+  const state = path.join(home, 'state');
+  const proj = path.join(home, '.claude', 'projects', 'p');
+  fs.mkdirSync(proj, { recursive: true });
+  fs.mkdirSync(state);
+  fs.writeFileSync(path.join(state, 'config.json'), JSON.stringify({ spaceId: 'x', writeToken: 'w', readToken: 'r', device: 'abcdabcdabcd' }));
+  const f = path.join(proj, 's.jsonl');
+  fs.writeFileSync(f, jsonl(user('a')));
+  const srv = await fakeServer(t, { 'POST /ingest': () => [200, { ok: true }] });
+  const env = { ...process.env, HOME: home, NUMABLE_USAGE_STATE_DIR: state, NUMABLE_USAGE_ENDPOINT: srv.endpoint };
+  delete env.NUMABLE_USAGE_DEBUG;
+  const cli = cliWith(env);
+  const ingests = () => srv.log.filter((x) => x.key === 'POST /ingest').length;
+  const idle = () => !fs.existsSync(path.join(state, 'lock'));
+
+  await cli('--tick');
+  await waitFor(() => ingests() === 1);
+  assert.equal(ingests(), 1);
+
+  fs.appendFileSync(f, jsonl(user('b')));      // 有新内容：若真起了采集就一定会推
+  await cli('--tick');
+  await new Promise((r) => setTimeout(r, 1500));
+  await waitFor(idle);
+  assert.equal(ingests(), 1);                   // 被节流，没起
+
+  await cli();                                  // SessionEnd：不节流
+  await waitFor(() => ingests() === 2);
+  assert.equal(ingests(), 2);
+});
+
+test('--link / --join：第二台电脑并进同一空间，保留自己的设备标识并清掉旧空间里的自己', async (t) => {
+  const A = { spaceId: 'spaceAAAA', writeToken: 'spaceAAAA.' + 'w'.repeat(43), readToken: 'spaceAAAA.' + 'r'.repeat(43) };
+  const srv = await fakeServer(t, {
+    'GET /s': (e) => (e.auth === 'Bearer ' + A.readToken ? [200, { sources: {} }] : [401, { error: 'unauthorized' }]),
+    'POST /forget': () => [200, { ok: true, removed: 1 }],
+    'POST /ingest': () => [200, { ok: true }],
+  });
+  const mkEnv = (dir) => ({ ...process.env, HOME: dir, NUMABLE_USAGE_STATE_DIR: path.join(dir, 'state'), NUMABLE_USAGE_ENDPOINT: srv.endpoint });
+
+  // 电脑 A 生成加入串
+  const homeA = tmp();
+  fs.mkdirSync(path.join(homeA, 'state'));
+  fs.writeFileSync(path.join(homeA, 'state', 'config.json'), JSON.stringify({ ...A, endpoint: srv.endpoint }));
+  const linkOut = await cliWith(mkEnv(homeA))('--link');
+  const code = (linkOut.match(/nu1\.[A-Za-z0-9_-]+/) || [])[0];
+  assert.ok(code, linkOut);
+
+  // 电脑 B：原先自己有一个空间
+  const homeB = tmp();
+  const stB = path.join(homeB, 'state');
+  fs.mkdirSync(stB);
+  fs.mkdirSync(path.join(homeB, '.claude', 'projects', 'p'), { recursive: true });
+  fs.writeFileSync(path.join(homeB, '.claude', 'projects', 'p', 's.jsonl'), jsonl(user('b')));
+  fs.writeFileSync(path.join(stB, 'config.json'), JSON.stringify({ spaceId: 'spaceBBBB', writeToken: 'spaceBBBB.oldw', readToken: 'spaceBBBB.oldr', device: 'bbbbbbbbbbbb' }));
+  const cliB = cliWith(mkEnv(homeB));
+
+  assert.match(await cliB('--join', 'garbage'), /这一串不对/);
+  assert.equal(srv.log.length, 0);                                     // 坏串不发请求
+
+  assert.match(await cliB('--join', code), /已加入/);
+  const cfg = JSON.parse(fs.readFileSync(path.join(stB, 'config.json'), 'utf8'));
+  assert.equal(cfg.spaceId, A.spaceId);
+  assert.equal(cfg.writeToken, A.writeToken);
+  assert.equal(cfg.device, 'bbbbbbbbbbbb');                            // 设备标识不变
+  const fg = srv.log.find((x) => x.key === 'POST /forget');
+  assert.deepEqual([fg.auth, fg.body], ['Bearer spaceBBBB.oldw', { source: 'claude-code', device: 'bbbbbbbbbbbb' }]);
+  const ing = srv.log.find((x) => x.key === 'POST /ingest');
+  assert.equal(ing.auth, 'Bearer ' + A.writeToken);                    // 立刻往新空间推了一次
+  assert.equal(ing.body.device, 'bbbbbbbbbbbb');
+
+  assert.match(await cliB('--join', code), /已经在这个空间里了/);
+});

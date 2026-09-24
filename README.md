@@ -13,7 +13,7 @@
 /plugin install numable-usage@numable
 ```
 
-装好后跑完一次 Claude Code 会话（插件会在会话开始/结束时采集），然后：
+装好后跑完一次 Claude Code 会话（插件会在会话开始、结束时采集，会话进行中每 10 分钟补一次），然后：
 
 1. 在 Claude Code 里运行 `/numable-usage`，复制它给出的**读取令牌**
 2. 打开 [Numable](https://numable.app) → 商店 → 装「Claude Code 用量」
@@ -63,6 +63,15 @@
 | 消息 | 你发的话 + Claude 的回复（同样按响应去重），不含工具返回结果、系统注入、subagent 内部往返 |
 | 活跃时段 | 只看你发的话 |
 | 会话 | 有过对话的 `sessionId` 个数，不含 subagent |
+
+## 多台电脑
+
+每台电脑装好插件后，默认各自有一个独立的空间。要让几台电脑的用量合并到同一组组件里：
+
+1. 在已经接入 Numable 的那台电脑上，对 Claude Code 说「生成加入其他电脑的串」（即 `/numable-usage`，背后是 `--link`）；
+2. 在另一台电脑上对 Claude Code 说「加入用量空间」并贴上那一串（`--join`）。
+
+加入后 Numable 里不用再绑第二个令牌，两台电脑的数字按天相加。那一串能往你的空间写数据，只在自己的电脑之间传。
 
 ## 数字偏大？可能是同一台电脑被算成了两台
 

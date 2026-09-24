@@ -102,6 +102,39 @@ ok(arr3.length === 1 && arr3[0].device === 'aabbcc112233', '✦ 只删了指定�
 ok(read3.j.merged.totals.msgs === 10, `✦ 合并结果不再含被删设备 (msgs=${read3.j.merged.totals.msgs})`);
 ok((await fg({ source: 'claude-code', device: 'ddeeff445566' }, writeToken)).j.removed === 0, '再删一次 → removed=0（幂等）');
 
+console.log('\n── ?today= 以看的人那天为锚 ──');
+{
+  const iso = (off) => new Date(Date.now() + off * 864e5).toISOString().slice(0, 10);
+  const D0 = iso(0);
+  const sp2 = await post('/space');
+  const W2 = sp2.j.writeToken, R2 = sp2.j.readToken;
+  const day = (date, extra = {}) => ({ date, msgs: 10, sessions: 1, out: 100, in: 1, cacheCreate: 0, ...extra });
+  // 两台电脑轮流用：一台 D-3、D-1，另一台 D-2 —— 各自的连续天数都是 1
+  await post('/ingest', { source: 'claude-code', device: 'aaaa0001', snapshot: {
+    days: [day(iso(-3)), day(iso(-1))],
+    byModel: { 'claude-opus-4-20250514': { in: 1, out: 100, msgs: 1 }, other: { in: 0, out: 0, msgs: 5 } },
+    totals: { streak: 1, longestStreak: 1 } } }, W2);
+  await post('/ingest', { source: 'claude-code', device: 'aaaa0002', snapshot: {
+    days: [day(iso(-2))], totals: { streak: 1, longestStreak: 1 } } }, W2);
+  const rd = (q) => J('/s' + q, { headers: { authorization: 'Bearer ' + R2 } });
+
+  const a = (await rd('?today=' + D0)).j.merged;
+  ok(a.today.date === D0 && a.today.msgs === 0, `✦ 今天没用 → today 是今天且为 0（${a.today.date} / ${a.today.msgs}）`);
+  ok(a.gridEnd === D0, `✦ 热力网格右下角是今天（${a.gridEnd}）`);
+  ok(a.totals.streak === 3, `✦ 两台电脑轮流用，连续天数按合并日期算 = 3（${a.totals.streak}）`);
+  ok(a.totals.longestStreak === 3, `最长连续 = 3（${a.totals.longestStreak}）`);
+  ok(a.models.length === 1 && a.models[0].label === 'Opus 4', `✦ 带发布日期的模型名标成「Opus 4」，零用量的 other 不列（${JSON.stringify(a.models.map((m) => m.label))}）`);
+
+  const b = (await rd('')).j.merged;
+  ok(b.today.date === iso(-1) && b.today.msgs === 10, '不带 ?today（老版本的包）→ 维持原行为：today = 数据里最后一天');
+  ok(b.totals.streak === 1, '不带 ?today → 连续天数维持原行为（各设备取最大）');
+  ok((await rd('?today=' + iso(-1))).j.merged.today.msgs === 10, '今天用过 → today 就是那天的数');
+  ok((await rd('?today=2020-01-01')).j.merged.today.date === iso(-1), '离服务器时间太远的 ?today 不认');
+  ok((await rd('?today=' + iso(-2))).j.merged.today.date === iso(-1), '看的人时区靠后（锚早于数据最后一天）→ 以数据为准');
+  const e = (await rd('?today=' + iso(2))).j.merged;
+  ok(e.totals.streak === 0 && e.today.msgs === 0, '隔了一天没用 → 连续天数归 0');
+}
+
 console.log('\n── 体积与设备数上限 ──');
 const big = { source: 'claude-code', device: 'aabbcc112233',
   snapshot: { days: [], byModel: {}, hours: {}, totals: {}, pad: 'x'.repeat(70000) } };
