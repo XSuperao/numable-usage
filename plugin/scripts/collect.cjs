@@ -491,9 +491,16 @@ async function collectAndPush() {
 
   if (!touched && !process.env.NUMABLE_USAGE_FORCE) { log('nothing changed, skip push'); return; }
 
-  const device = crypto.createHash('sha256')
-    .update(os.hostname() + '|' + os.userInfo().username)   // 主机名常含真名 —— 只上报 hash
-    .digest('hex').slice(0, 12);
+  // 设备标识第一次算出后钉进 config，之后不再重算。
+  // ⚠️ macOS 没设 HostName 时 os.hostname() 随网络变（DHCP / Bonjour 名），
+  // 每变一次服务端就多出一行「设备」，App 按天合并各设备 → 同一台机器的日子被重复计算。
+  if (!cfg.device) {
+    cfg.device = crypto.createHash('sha256')
+      .update(os.hostname() + '|' + os.userInfo().username)   // 主机名常含真名 —— 只上报 hash
+      .digest('hex').slice(0, 12);
+    writeJson(CONFIG, cfg);
+  }
+  const device = cfg.device;
 
   const payload = buildPayload(history, device);
   const r = await post('/ingest', payload, cfg.writeToken);

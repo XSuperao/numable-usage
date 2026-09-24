@@ -231,3 +231,39 @@ test('hook 入口立刻返回，采集在后台跑完', async (t) => {
   assert.equal(h.days[DAY].out, 10);
   assert.ok(!fs.existsSync(path.join(state, 'lock')));
 });
+
+test('设备标识首次写进 config，之后固定用它（主机名变了也不换）', async (t) => {
+  const home = tmp();
+  const state = path.join(home, 'state');
+  const proj = path.join(home, '.claude', 'projects', 'p');
+  fs.mkdirSync(proj, { recursive: true });
+  fs.mkdirSync(state);
+  const cfgPath = path.join(state, 'config.json');
+  const f = path.join(proj, 's.jsonl');
+
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => { b += c; });
+    req.on('end', () => { seen.push(JSON.parse(b).device); res.end('{"ok":true}'); });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const env = { ...process.env, HOME: home, NUMABLE_USAGE_STATE_DIR: state,
+                NUMABLE_USAGE_ENDPOINT: `http://127.0.0.1:${server.address().port}` };
+  const runOnce = () => new Promise((resolve) => spawn(process.execPath, [SCRIPT, '--run'], { env, stdio: 'ignore' }).on('exit', resolve));
+
+  // 老 config 没有 device：算一次并写回
+  fs.writeFileSync(cfgPath, JSON.stringify({ spaceId: 'x', writeToken: 'w', readToken: 'r' }));
+  fs.writeFileSync(f, jsonl(user('a')));
+  await runOnce();
+  const pinned = JSON.parse(fs.readFileSync(cfgPath, 'utf8')).device;
+  assert.match(pinned, /^[a-f0-9]{12}$/);
+  assert.equal(seen[0], pinned);
+
+  // config 里已有的标识（模拟「主机名后来变了」：按主机名重算必然 ≠ 它）必须原样沿用
+  fs.writeFileSync(cfgPath, JSON.stringify({ spaceId: 'x', writeToken: 'w', readToken: 'r', device: 'abc123abc123' }));
+  fs.appendFileSync(f, jsonl(user('b')));
+  await runOnce();
+  assert.equal(seen[1], 'abc123abc123');
+});
