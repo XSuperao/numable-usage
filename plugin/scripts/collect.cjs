@@ -29,6 +29,7 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const readline = require('node:readline');
+const { spawn } = require('node:child_process');
 
 const HOME = os.homedir();
 const CLAUDE_DIR = path.join(HOME, '.claude');
@@ -437,7 +438,23 @@ async function main() {
   if (arg === '--status') return cmdStatus();
   if (arg === '--code') return cmdCode();
   if (arg === '--token') return cmdToken();
+  if (arg === '--run' || DEBUG) return runCollect();
 
+  // hook 入口：把采集甩给一个脱离会话的后台进程，自己立刻退出。
+  // 首次（或 history 升级后）全量重扫要十几秒，挂在 SessionStart 上会让会话卡住等它。
+  // ⚠️ stdio 必须 ignore：子进程只要还握着 hook 的输出管道，Claude Code 就会等它。
+  // detached = 自成进程组，会话退出（SessionEnd 之后）不会连带杀掉它。
+  try {
+    spawn(process.execPath, [__filename, '--run'], {
+      detached: true, stdio: 'ignore', windowsHide: true, env: process.env,
+    }).unref();
+  } catch (e) {
+    log('spawn failed, run inline', e && e.message);
+    return runCollect();
+  }
+}
+
+async function runCollect() {
   // 读-改-写 config / history 全程持锁；拿不到（别的会话正在采集）就放弃这一轮 ——
   // 它会顺带把本会话已写下的行也扫进去，漏掉的尾巴下一次 hook 触发时补上。
   const release = await acquireLock();

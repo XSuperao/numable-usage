@@ -148,7 +148,7 @@ test('锁：持有期间别人拿不到；持锁进程已死则可抢', async ()
   assert.equal(C.tryLock(lock), true);
 });
 
-test('多个会话同时首次触发：只建一个空间、history 不写坏、数字不重不漏', async () => {
+test('多个会话同时首次触发：只建一个空间、history 不写坏、数字不重不漏', async (t) => {
   const home = tmp();
   const state = path.join(home, 'state');
   const proj = path.join(home, '.claude', 'projects', 'p');
@@ -172,12 +172,12 @@ test('多个会话同时首次触发：只建一个空间、history 不写坏、
     });
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => { server.closeAllConnections(); server.close(); });  // 断言失败也要关，否则测试进程挂住
   const endpoint = `http://127.0.0.1:${server.address().port}`;
 
   const env = { ...process.env, HOME: home, NUMABLE_USAGE_STATE_DIR: state, NUMABLE_USAGE_ENDPOINT: endpoint };
-  const once = () => new Promise((resolve) => spawn(process.execPath, [SCRIPT], { env, stdio: 'ignore' }).on('exit', resolve));
+  const once = () => new Promise((resolve) => spawn(process.execPath, [SCRIPT, '--run'], { env, stdio: 'ignore' }).on('exit', resolve));
   const codes = await Promise.all(Array.from({ length: 6 }, once));
-  server.close();
   assert.deepEqual(codes, [0, 0, 0, 0, 0, 0]);
 
   assert.equal(calls.space, 1);
@@ -187,4 +187,47 @@ test('多个会话同时首次触发：只建一个空间、history 不写坏、
   assert.equal(h.days[DAY].msgs, 20 * 200 * 2);
   assert.equal(h.days[DAY].out, 20 * 200 * 10);
   assert.deepEqual(fs.readdirSync(state).sort(), ['config.json', 'history.json']); // 无残留 tmp / lock
+});
+
+test('hook 入口立刻返回，采集在后台跑完', async (t) => {
+  const home = tmp();
+  const state = path.join(home, 'state');
+  const proj = path.join(home, '.claude', 'projects', 'p');
+  fs.mkdirSync(proj, { recursive: true });
+  fs.mkdirSync(state);
+  fs.writeFileSync(path.join(state, 'config.json'), JSON.stringify({ spaceId: 'x', writeToken: 'w', readToken: 'r' }));
+  fs.writeFileSync(path.join(proj, 's.jsonl'), jsonl(user('q'), asst('m1', 'r1', 10), asst('m1', 'r1', 10)));
+
+  // 推送故意慢 1.5s：前台实现下 hook 进程必然活过它
+  let ingested = 0;
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => setTimeout(() => { ingested++; res.end('{"ok":true}'); }, 1500));
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => { server.closeAllConnections(); server.close(); });  // 断言失败也要关，否则测试进程挂住
+  const env = { ...process.env, HOME: home, NUMABLE_USAGE_STATE_DIR: state,
+                NUMABLE_USAGE_ENDPOINT: `http://127.0.0.1:${server.address().port}` };
+  delete env.NUMABLE_USAGE_DEBUG;
+
+  // 用 pipe 而不是 ignore：'close' 要等所有持有管道的进程都放手 ——
+  // 后台子进程若继承了 hook 的输出管道，这里会一直等到它跑完，正是 Claude Code 会卡住的情形
+  const t0 = Date.now();
+  const code = await new Promise((resolve) => {
+    const p = spawn(process.execPath, [SCRIPT], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    p.stdin.end('{"hook_event_name":"SessionStart"}');
+    p.stdout.resume(); p.stderr.resume();
+    p.on('close', resolve);
+  });
+  assert.equal(code, 0);
+  assert.ok(Date.now() - t0 < 1000, `hook 用了 ${Date.now() - t0}ms`);
+  assert.equal(ingested, 0);
+
+  const until = Date.now() + 15000;
+  while (ingested === 0 && Date.now() < until) await new Promise((r) => setTimeout(r, 100));
+  await new Promise((r) => setTimeout(r, 200));        // 等它释放锁
+  assert.equal(ingested, 1);
+  const h = JSON.parse(fs.readFileSync(path.join(state, 'history.json'), 'utf8'));
+  assert.equal(h.days[DAY].out, 10);
+  assert.ok(!fs.existsSync(path.join(state, 'lock')));
 });

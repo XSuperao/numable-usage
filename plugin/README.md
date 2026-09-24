@@ -66,12 +66,15 @@
 | `NUMABLE_USAGE_MODELS=all` | 上报完整模型名（默认非 Claude 模型并入 `other`） |
 | `NUMABLE_USAGE_ENDPOINT` | 换服务端（自建时用） |
 | `NUMABLE_USAGE_STATE_DIR` | 换本机状态目录 |
-| `NUMABLE_USAGE_DEBUG=1` | 打印诊断到 stderr |
+| `NUMABLE_USAGE_DEBUG=1` | 打印诊断到 stderr（此时改在前台运行，方便看输出） |
 
 ## 失败姿态
 
-采集挂在 `SessionEnd` / `SessionStart` 上。**任何失败都静默吞掉**（退出码恒为 0，stdout 恒为空）——
-断网、文件缺失、历史损坏都不会打断你的 Claude Code 会话。
+采集挂在 `SessionEnd` / `SessionStart` 上，但 hook 本身**立刻返回**：真正的扫描与推送交给一个
+脱离会话的后台进程，所以首次接入时的全量扫描（会话记录多时要十几秒）也不会让会话卡住。
+多个会话同时触发时靠本机锁串行，同一时刻只有一个在采集。
+
+**任何失败都静默吞掉**（退出码恒为 0，stdout 恒为空）——断网、文件缺失、历史损坏都不会打断你的 Claude Code 会话。
 
 ## 性能
 
