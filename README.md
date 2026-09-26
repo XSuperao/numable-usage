@@ -9,7 +9,7 @@
 ## 安装
 
 ```
-/plugin marketplace add XSuperao/numable-usage
+/plugin marketplace add numable/numable-usage
 /plugin install numable-usage@numable
 ```
 
