@@ -2,7 +2,7 @@
 
 把你的 **Claude Code 用量**做成手机与桌面小组件 —— 会话数、消息量、token 消耗、费用估算、5 小时窗口、活跃热力图、按模型 / 工具 / 项目分布。
 
-配套 [Numable](https://numable.app)（iOS / Android / HarmonyOS / Windows）。
+配套 [Numable](https://get.numable.app)（iPhone / iPad / Mac / Android / HarmonyOS / Windows,应用商店即将上架）。
 
 ## 装
 

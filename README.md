@@ -2,7 +2,7 @@
 
 把你的 **Claude Code 用量**做成手机与桌面小组件 —— 会话数、消息量、token 消耗、费用估算、5 小时窗口、活跃热力图、按模型 / 工具 / 项目分布。
 
-搭配 [Numable](https://numable.app)（iOS · Android · HarmonyOS · Windows）使用。
+搭配 [Numable](https://get.numable.app)（iPhone · iPad · Mac · Android · HarmonyOS · Windows,应用商店即将上架）使用。
 
 <!-- 截图位（发布后补） -->
 
@@ -16,10 +16,10 @@
 装好后跑完一次 Claude Code 会话（插件会在会话开始、结束时采集，会话进行中每 10 分钟补一次），然后：
 
 1. 在 Claude Code 里运行 `/numable-usage`，复制它给出的**读取令牌**
-2. 打开 [Numable](https://numable.app) → 商店 → 装「Claude Code 用量」
+2. 打开 [Numable](https://get.numable.app) → 商店 → 装「Claude Code 用量」
 3. 我的 → 凭证管理 → 在「包的凭证槽」里点这个包的**「绑定」** → **「+ 新建凭证」**
    → 粘贴令牌 → 保存（类型与域名已按包声明预填好，保存即完成绑定）
-4. 仪表盘 → ＋ → 选「Claude Code 用量」→ 挑卡
+4. 仪表盘 → ＋ → 选「Claude Code 用量」→ 挑组件
 
 > 第 3 步要从**槽位的「绑定」**进，不要从「+ 新建凭证」独立入口进 ——
 > 后者不会自动绑定，还得手选类型。
