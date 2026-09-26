@@ -4,7 +4,8 @@
 
 搭配 [Numable](https://get.numable.app)（iPhone · iPad · Mac · Android · HarmonyOS · Windows,应用商店即将上架）使用。
 
-<!-- 截图位（发布后补） -->
+<p align="center"><img src="assets/dashboard-zh.jpg" width="360" alt="Numable 仪表盘上的 Claude Code 用量组件（iPhone，深色，真实数据）"></p>
+<p align="center"><sub>iPhone · 深色 · 真实数据（项目名已匿名为「项目 A–E」）</sub></p>
 
 ## 安装
 
